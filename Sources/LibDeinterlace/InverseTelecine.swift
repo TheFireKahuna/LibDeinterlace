@@ -42,6 +42,10 @@ public final class InverseTelecine {
         public let picture: BwdifWindow.Picture
         let fixedPTS: Int64?
         let result: Int?
+        /// Where the GPU writes whether decimate keeps the picture: a 64-bit word, 1 kept and 0 dropped, written by the
+        /// pass that puts the picture out, for work later in its batch to be dispatched on (the picture's finish). Nil
+        /// when nothing drops it.
+        public let kept: (buffer: MTLBuffer, offset: Int)?
     }
 
     /// What one ``push(_:into:)`` encoded: the pictures it puts out, and every picture its work reads or writes, which
@@ -167,7 +171,8 @@ public final class InverseTelecine {
         for _ in 0..<Self.passesInFlight {
             guard let map = device.makeBuffer(length: max(sizes.map, 16), options: .storageModePrivate),
                   let partials = device.makeBuffer(length: 4 * max(sizes.partials, 4), options: .storageModePrivate),
-                  let stats = device.makeBuffer(length: 4 * 5 * cells.x * cells.y, options: .storageModePrivate),
+                  let stats = device.makeBuffer(length: 4 * DeinterlaceKernels.statisticsLength(cells: cells.x * cells.y),
+                                                options: .storageModePrivate),
                   let blocks = device.makeBuffer(length: 4 * nxblocks * nyblocks, options: .storageModePrivate)
             else { return nil }
             sets.append(Scratch(map: map, partials: partials, stats: stats, blocks: blocks))
@@ -263,8 +268,9 @@ public final class InverseTelecine {
 
     // MARK: fieldmatch
 
-    /// filter_frame: `picture` nil flushes the last one. The comparison, the luma statistics, the decision and the
-    /// weave, behind barriers where each reads the one before.
+    /// filter_frame: `picture` nil flushes the last one. The luma differences; the scene-change test beside the field
+    /// difference map; the accumulations beside the comb counts (a scene change's alone); the decision; the weave. Each
+    /// phase behind a barrier, as it reads the one before.
     private func match(_ picture: BwdifWindow.Picture?, work: Scratch, pass: any DeinterlacePass,
                        pushed: inout Pushed) -> Matched? {
         // SLIDING_FRAME_WINDOW
@@ -284,21 +290,25 @@ public final class InverseTelecine {
         pushed.touched += [prv, src, nxt, out]
         let windowArguments = windowPending(next: out)
         guard kernels.encodeClear(work.map, words: (work.map.length + 3) / 4, layout: layout, pass: pass),
-              kernels.encodeLumaStatistics(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
-                                           pnParity: 1 - field, layout: layout, width: width, height: height,
-                                           cthresh: Self.cthresh, stats: work.stats, pass: pass) else { return nil }
+              kernels.encodeLumaDifferences(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
+                                            layout: layout, width: width, height: height, stats: work.stats, pass: pass)
+        else { return nil }
         pass.barrier()
-        guard kernels.encodeFieldMatchCompare(src: src.storage.planes, prev: src.storage.planes, next: prv.storage.planes,
+        guard kernels.encodeScene(stats: work.stats, cells: cells, state: state, reset: resetPending, emitted: emitted,
+                                  scthresh: scthresh, layout: layout, pass: pass),
+              kernels.encodeFieldMatchCompare(src: src.storage.planes, prev: src.storage.planes, next: prv.storage.planes,
                                               layout: layout, width: width, height: height, fbase1: fbase, fbase2: fbase,
                                               mapFromNextField: field == 1, hsub: Int(layout.log2ChromaW), map: work.map,
-                                              partials: work.partials, pass: pass) else { return nil }
-        pass.barrier()
-        guard kernels.encodeMatchDecide(partials: work.partials, partialCount: partialCount, stats: work.stats, cells: cells,
-                                        state: state, records: records, record: record, reset: resetPending,
-                                        window: windowArguments, emitted: emitted, scthresh: scthresh, layout: layout,
-                                        pass: pass) else { return nil }
+                                              partials: work.partials, pass: pass),
+              kernels.encodeCombCounts(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
+                                       pnParity: 1 - field, layout: layout, width: width, height: height,
+                                       cthresh: Self.cthresh, stats: work.stats, pass: pass) else { return nil }
         resetPending = false
         emitted += 1
+        pass.barrier()
+        guard kernels.encodeMatchDecide(partials: work.partials, partialCount: partialCount, stats: work.stats, cells: cells,
+                                        state: state, records: records, record: record, window: windowArguments,
+                                        layout: layout, pass: pass) else { return nil }
         pass.barrier()
         guard kernels.encodeWeave(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
                                   srcParity: 1 - field, records: records, record: record, layout: layout, width: width,
@@ -353,7 +363,7 @@ public final class InverseTelecine {
                                   decided: (records, cur.record), pass: pass) else { return nil }
         pass.barrier()
         guard decimates else {
-            pushed.outputs.append(Output(picture: out, fixedPTS: pts, result: nil))
+            pushed.outputs.append(Output(picture: out, fixedPTS: pts, result: nil, kept: nil))
             return nil
         }
         return (out, pts)
@@ -397,7 +407,8 @@ public final class InverseTelecine {
                                    state: state, results: results, layout: layout, pass: pass)
         pass.barrier()
         for (i, item) in queue.enumerated() {
-            pushed.outputs.append(Output(picture: item.picture, fixedPTS: nil, result: base + i))
+            pushed.outputs.append(Output(picture: item.picture, fixedPTS: nil, result: base + i,
+                                         kept: (results, 16 * (base + i) + 8)))
         }
         queue.removeAll()
     }

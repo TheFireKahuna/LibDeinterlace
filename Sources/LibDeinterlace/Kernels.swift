@@ -292,24 +292,64 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         return true
     }
 
-    /// One picture's luma statistics (iv_luma): |prv - src| and |src - nxt| per 8 x 8 cell, then the comb counts of the
-    /// weaves p, c and n, into `stats` (five grids of `cells` words).
-    func encodeLumaStatistics(prv: PlaneSet, src: PlaneSet, nxt: PlaneSet, pnParity: Int, layout: PictureLayout, width: Int,
-                              height: Int, cthresh: Int, stats: MTLBuffer, pass: any DeinterlacePass) -> Bool {
-        guard let luma = try? pipeline(for: layout, function: "iv_luma") else { return false }
-        let cellsX = (width + 7) / 8, cellsY = (height + 7) / 8
+    /// The words of a picture's statistics buffer for `cells` 8 x 8 cells: the two luma differences' grids, the comb
+    /// grids of the weaves p, c and n, then iv_scene's comb dispatch and scene-change flag.
+    static func statisticsLength(cells: Int) -> Int { 5 * cells + 4 }
+
+    private func lumaArguments(prv: PlaneSet, src: PlaneSet, nxt: PlaneSet, pnParity: Int, width: Int, height: Int,
+                               cthresh: Int) -> Arguments {
         var arguments = Arguments()
         arguments.words(words(prv) + words(src) + words(nxt))
         arguments.words([UInt32(width), UInt32(height), UInt32(pnParity), UInt32(bitPattern: Int32(cthresh)),
-                         UInt32(cellsX), UInt32(cellsY)])
+                         UInt32((width + 7) / 8), UInt32((height + 7) / 8)])
+        return arguments
+    }
+
+    /// |prv - src| and |src - nxt| per 8 x 8 cell (iv_luma), into the statistics buffer's first two grids.
+    func encodeLumaDifferences(prv: PlaneSet, src: PlaneSet, nxt: PlaneSet, layout: PictureLayout, width: Int, height: Int,
+                               stats: MTLBuffer, pass: any DeinterlacePass) -> Bool {
+        guard let luma = try? pipeline(for: layout, function: "iv_luma") else { return false }
         pass.setPipeline(luma)
         pass.setBuffer(prv.buffer, offset: 0, index: 0)
         pass.setBuffer(src.buffer, offset: 0, index: 5)
         pass.setBuffer(nxt.buffer, offset: 0, index: 6)
         pass.setBuffer(stats, offset: 0, index: 7)
-        pass.setBuffer(stats, offset: 4 * 2 * cellsX * cellsY, index: 8)
-        arguments.bind(pass, index: 1)
-        pass.dispatchThreadgroups(MTLSize(width: cellsX, height: cellsY, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        lumaArguments(prv: prv, src: src, nxt: nxt, pnParity: 0, width: width, height: height, cthresh: 0).bind(pass, index: 1)
+        pass.dispatchThreadgroups(MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        return true
+    }
+
+    /// The scene-change test (iv_scene) over iv_luma's differences: the comb counts' dispatch and the flag the decision
+    /// reads, and with `reset` the chain's state started over.
+    func encodeScene(stats: MTLBuffer, cells: (x: Int, y: Int), state: MTLBuffer, reset: Bool, emitted: Int64,
+                     scthresh: Int64, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
+        var arguments = Arguments()
+        arguments.words([UInt32(cells.x), UInt32(cells.y), reset ? 1 : 0, 0])
+        arguments.longs([emitted, scthresh])
+        return encodeDecision("iv_scene", layout: layout, pass: pass) { pass in
+            pass.setBuffer(stats, offset: 0, index: 5)
+            pass.setBuffer(state, offset: 0, index: 7)
+            pass.setBuffer(stats, offset: 4 * 5 * cells.x * cells.y, index: 8)
+            arguments.bind(pass, index: 1)
+        }
+    }
+
+    /// The comb counts of the weaves p, c and n per 8 x 8 cell (iv_comb), dispatched as iv_scene decided: every cell on
+    /// a scene change, none otherwise.
+    func encodeCombCounts(prv: PlaneSet, src: PlaneSet, nxt: PlaneSet, pnParity: Int, layout: PictureLayout, width: Int,
+                          height: Int, cthresh: Int, stats: MTLBuffer, pass: any DeinterlacePass) -> Bool {
+        guard let comb = try? pipeline(for: layout, function: "iv_comb") else { return false }
+        let cells = ((width + 7) / 8) * ((height + 7) / 8)
+        pass.setPipeline(comb)
+        pass.setBuffer(prv.buffer, offset: 0, index: 0)
+        pass.setBuffer(src.buffer, offset: 0, index: 5)
+        pass.setBuffer(nxt.buffer, offset: 0, index: 6)
+        pass.setBuffer(stats, offset: 4 * 2 * cells, index: 8)
+        lumaArguments(prv: prv, src: src, nxt: nxt, pnParity: pnParity, width: width, height: height, cthresh: cthresh)
+            .bind(pass, index: 1)
+        pass.dispatchThreadgroups(indirectBuffer: stats, offset: 4 * 5 * cells,
+                                  threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         return true
     }
 
@@ -325,17 +365,18 @@ public final class DeinterlaceKernels: @unchecked Sendable {
 
     /// The match decision (iv_match_decide), with bwdif's window decision for the picture before it when `window` is set.
     func encodeMatchDecide(partials: MTLBuffer, partialCount: Int, stats: MTLBuffer, cells: (x: Int, y: Int), state: MTLBuffer,
-                           records: MTLBuffer, record: UInt32, reset: Bool,
+                           records: MTLBuffer, record: UInt32,
                            window: (prev: UInt32, cur: UInt32, prevRepeat: Bool, nextRepeat: Bool, start: Bool)?,
-                           emitted: Int64, scthresh: Int64, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
+                           layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
         var arguments = Arguments()
-        arguments.words([UInt32(partialCount), UInt32(cells.x), UInt32(cells.y), record, reset ? 1 : 0, window == nil ? 0 : 1,
+        arguments.words([UInt32(partialCount), UInt32(cells.x), UInt32(cells.y), record, window == nil ? 0 : 1,
                          window?.prev ?? 0, window?.cur ?? 0, window?.prevRepeat == true ? 1 : 0, window?.nextRepeat == true ? 1 : 0,
-                         window?.start == true ? 1 : 0, 0])
-        arguments.longs([emitted, scthresh])
+                         window?.start == true ? 1 : 0])
+        let cellCount = cells.x * cells.y
         return encodeDecision("iv_match_decide", layout: layout, pass: pass) { pass in
             pass.setBuffer(partials, offset: 0, index: 0)
-            pass.setBuffer(stats, offset: 0, index: 5)
+            pass.setBuffer(stats, offset: 4 * 2 * cellCount, index: 5)
+            pass.setBuffer(stats, offset: 4 * 5 * cellCount, index: 6)
             pass.setBuffer(state, offset: 0, index: 7)
             pass.setBuffer(records, offset: 0, index: 8)
             arguments.bind(pass, index: 1)

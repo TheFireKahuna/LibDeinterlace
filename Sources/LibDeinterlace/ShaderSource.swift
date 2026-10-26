@@ -449,9 +449,9 @@ constant uint IV_LASTSCDIFF = 0, IV_LASTN = 1, IV_FIELD_END = 2, IV_START_SET = 
               IV_LAST_DURATION = 6, IV_CYCLES = 7, IV_CYCLES_WITH_DUPLICATE = 8, IV_MAXBDIFF = 9, IV_TOTDIFF = 14;
 constant uint IV_THREADS = 256;
 
-// One picture's luma statistics for fieldmatch, every one from a single read of its rows: |prv - src| and
-// |src - nxt| summed per threadgroup (luma_abs_diff), and calc_combed_score's cell counts for the weaves p, c and n.
-// A threadgroup is one 8 x 8 cell, so each cell's counts are written once, whole.
+// One picture's luma statistics for fieldmatch, read once from its rows: |prv - src| and |src - nxt| summed per 8 x 8
+// cell (luma_abs_diff), and, from iv_comb, calc_combed_score's cell counts for the weaves p, c and n. A threadgroup is
+// one cell, so each cell's values are written once, whole.
 struct IVLuma {
     PFPicture prv;
     PFPicture src;
@@ -469,54 +469,124 @@ kernel void iv_luma(device const uchar*  prvb  [[buffer(0)]],
                     device const uchar*  srcb  [[buffer(5)]],
                     device const uchar*  nxtb  [[buffer(6)]],
                     device uint*         luma  [[buffer(7)]],
-                    device uint*         cells [[buffer(8)]],
                     uint2                gid   [[thread_position_in_grid]],
                     uint2                tgid  [[threadgroup_position_in_grid]],
                     uint                 tindex [[thread_index_in_threadgroup]]) {
-    threadgroup atomic_uint sums[5];
-    if (tindex < 5u) { atomic_store_explicit(&sums[tindex], 0u, memory_order_relaxed); }
+    threadgroup atomic_uint sums[2];
+    if (tindex < 2u) { atomic_store_explicit(&sums[tindex], 0u, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    int x = int(gid.x), y = int(gid.y), w = int(l.width), h = int(l.height);
-    if (x < w && y < h) {
+    int x = int(gid.x), y = int(gid.y);
+    if (x < int(l.width) && y < int(l.height)) {
         int s = fm_read(srcb, l.src, 0u, x, y);
         uint dp = uint(abs(fm_read(prvb, l.prv, 0u, x, y) - s)), dn = uint(abs(s - fm_read(nxtb, l.nxt, 0u, x, y)));
         if (dp) { atomic_fetch_add_explicit(&sums[0], dp, memory_order_relaxed); }
         if (dn) { atomic_fetch_add_explicit(&sums[1], dn, memory_order_relaxed); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tindex < 2u) {
+        luma[tindex * l.cells_x * l.cells_y + tgid.y * l.cells_x + tgid.x] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
+    }
+}
+
+struct IVScene {
+    uint cells_x;
+    uint cells_y;
+    uint reset;          // the chain starts over (a seek): fieldmatch's scene-change state, bwdif's, decimate's
+    uint pad;
+    long emitted;        // the pictures fieldmatch has put out before this one
+    long scthresh;
+};
+
+// fieldmatch's scene-change test (combmatch=sc) from the luma differences. Comb scores are read only on a scene change,
+// so the test is also the comb kernel's dispatch: its threadgroups, every cell or none, then the flag the decision
+// reads. One threadgroup of IV_THREADS.
+kernel void iv_scene(constant IVScene&   s     [[buffer(1)]],
+                     device const uint*  luma  [[buffer(5)]],
+                     device long*        state [[buffer(7)]],
+                     device uint*        scene [[buffer(8)]],
+                     uint                tid   [[thread_index_in_threadgroup]]) {
+    threadgroup ulong sums[2][IV_THREADS];
+    ulong prevSum = 0, nextSum = 0;
+    uint cellCount = s.cells_x * s.cells_y;
+    for (uint i = tid; i < cellCount; i += IV_THREADS) {
+        prevSum += ulong(luma[i]);
+        nextSum += ulong(luma[cellCount + i]);
+    }
+    sums[0][tid] = prevSum;
+    sums[1][tid] = nextSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = IV_THREADS / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            sums[0][tid] += sums[0][tid + stride];
+            sums[1][tid] += sums[1][tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid != 0u) { return; }
+    if (s.reset != 0u) {
+        state[IV_LASTSCDIFF] = 0; state[IV_LASTN] = 0; state[IV_FIELD_END] = 0;
+        state[IV_START_SET] = 0; state[IV_START_PTS] = 0; state[IV_LAST_PTS] = 0; state[IV_LAST_DURATION] = 0;
+    }
+    long prevDiff = long(sums[0][0]), nextDiff = long(sums[1][0]);
+    bool sc = false;
+    if (state[IV_LASTN] == s.emitted - 1) {
+        if (state[IV_LASTSCDIFF] > s.scthresh) { sc = true; }
+    } else if (prevDiff > s.scthresh) {
+        sc = true;
+    }
+    if (!sc) {
+        state[IV_LASTN] = s.emitted;
+        state[IV_LASTSCDIFF] = nextDiff;
+        sc = nextDiff > s.scthresh;
+    }
+    scene[0] = sc ? s.cells_x : 0u;
+    scene[1] = sc ? s.cells_y : 0u;
+    scene[2] = 1u;
+    scene[3] = sc ? 1u : 0u;
+}
+
+// calc_combed_score's cell counts for the weaves p, c and n, on a scene change alone (iv_scene's dispatch).
+kernel void iv_comb(device const uchar*  prvb  [[buffer(0)]],
+                    constant IVLuma&     l     [[buffer(1)]],
+                    device const uchar*  srcb  [[buffer(5)]],
+                    device const uchar*  nxtb  [[buffer(6)]],
+                    device uint*         cells [[buffer(8)]],
+                    uint2                gid   [[thread_position_in_grid]],
+                    uint2                tgid  [[threadgroup_position_in_grid]],
+                    uint                 tindex [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint sums[3];
+    if (tindex < 3u) { atomic_store_explicit(&sums[tindex], 0u, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int x = int(gid.x), y = int(gid.y), w = int(l.width), h = int(l.height);
+    if (x < w && y < h) {
         // Weaves by match: p (rows not of pn_parity from prv), c (src alone), n (from nxt).
         if (fm_combed(srcb, l.src, prvb, l.prv, l.pn_parity, w, h, l.cthresh, x, y)) {
-            atomic_fetch_add_explicit(&sums[2], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sums[0], 1u, memory_order_relaxed);
         }
         if (fm_combed(srcb, l.src, srcb, l.src, 0u, w, h, l.cthresh, x, y)) {
-            atomic_fetch_add_explicit(&sums[3], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sums[1], 1u, memory_order_relaxed);
         }
         if (fm_combed(srcb, l.src, nxtb, l.nxt, l.pn_parity, w, h, l.cthresh, x, y)) {
-            atomic_fetch_add_explicit(&sums[4], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sums[2], 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint cell = tgid.y * l.cells_x + tgid.x, cellCount = l.cells_x * l.cells_y;
-    if (tindex < 2u) {
-        luma[tindex * cellCount + cell] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
-    } else if (tindex < 5u) {
-        cells[(tindex - 2u) * cellCount + cell] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
+    if (tindex < 3u) {
+        cells[tindex * l.cells_x * l.cells_y + tgid.y * l.cells_x + tgid.x] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
     }
 }
 
 struct IVMatch {
     uint partials;       // fm_accumulate's words: six a threadgroup, every plane
-    uint cells_x;        // iv_luma's cells: the two differences' partials, then a comb grid per weave p, c, n
+    uint cells_x;        // iv_comb's cells: a comb grid per weave p, c, n
     uint cells_y;
     uint record;
-    uint reset;          // the chain starts over (a seek): fieldmatch's scene-change state, bwdif's, decimate's
     uint window;         // bwdif's window has a picture to decide: window_prev / window_cur, with this one as next
     uint window_prev;
     uint window_cur;
     uint prev_repeat;
     uint next_repeat;
     uint window_start;   // the window's first output since the start: its first deinterlaced field is intra
-    uint pad;
-    long emitted;        // the pictures fieldmatch has put out before this one
-    long scthresh;
 };
 
 // vf_fieldmatch.c compare_fields' decision from its six accumulations, between match1 and match2.
@@ -561,67 +631,49 @@ static inline void iv_window(device long* state, device IVRecord* records, uint 
 
 static inline int iv_cell(device const uint* cells, constant IVMatch& m, uint grid, int y, int x) {
     if (y < 0 || x < 0 || y >= int(m.cells_y) || x >= int(m.cells_x)) { return 0; }
-    return int(cells[(2u + grid) * m.cells_x * m.cells_y + uint(y) * m.cells_x + uint(x)]);
+    return int(cells[grid * m.cells_x * m.cells_y + uint(y) * m.cells_x + uint(x)]);
 }
 
-// One picture's fieldmatch decision (filter_frame at the defaults): the sums reduced, compare_fields(c, p), the
-// scene-change test, checkmm(match, n) and the combed verdict, into the picture's record; then, with this picture as
-// bwdif's next, the window's decision for the one before it. One threadgroup of IV_THREADS.
+// One picture's fieldmatch decision (filter_frame at the defaults): the sums reduced, compare_fields(c, p), then on
+// iv_scene's scene change checkmm(match, n) over the comb counts and the combed verdict, into the picture's record; then,
+// with this picture as bwdif's next, the window's decision for the one before it. One threadgroup of IV_THREADS.
 kernel void iv_match_decide(device const uint*  partials [[buffer(0)]],
                             constant IVMatch&   m        [[buffer(1)]],
-                            device const uint*  stats    [[buffer(5)]],
+                            device const uint*  cells    [[buffer(5)]],
+                            device const uint*  scene    [[buffer(6)]],
                             device long*        state    [[buffer(7)]],
                             device IVRecord*    records  [[buffer(8)]],
                             uint                tid      [[thread_index_in_threadgroup]]) {
-    threadgroup ulong sums[8][IV_THREADS];
+    threadgroup ulong sums[6][IV_THREADS];
     threadgroup int combs[3][IV_THREADS];
-    ulong own[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    bool sc = scene[3] != 0u;
+    ulong own[6] = {0, 0, 0, 0, 0, 0};
     for (uint i = tid; i < m.partials; i += IV_THREADS) { own[i % 6u] += ulong(partials[i]); }
-    uint cellCount = m.cells_x * m.cells_y;
-    for (uint i = tid; i < cellCount; i += IV_THREADS) {
-        own[6] += ulong(stats[i]);
-        own[7] += ulong(stats[cellCount + i]);
-    }
     int best[3] = {0, 0, 0};
-    uint windows = (m.cells_y + 1u) * (m.cells_x + 1u);
+    // The comb counts exist on a scene change alone; otherwise every score is fieldmatch's -1, unread.
+    uint windows = sc ? (m.cells_y + 1u) * (m.cells_x + 1u) : 0u;
     for (uint w = tid; w < windows; w += IV_THREADS) {
         int y = int(w / (m.cells_x + 1u)) - 1, x = int(w % (m.cells_x + 1u)) - 1;
         for (uint g = 0; g < 3u; ++g) {
-            int v = iv_cell(stats, m, g, y, x) + iv_cell(stats, m, g, y, x + 1) + iv_cell(stats, m, g, y + 1, x)
-                  + iv_cell(stats, m, g, y + 1, x + 1);
+            int v = iv_cell(cells, m, g, y, x) + iv_cell(cells, m, g, y, x + 1) + iv_cell(cells, m, g, y + 1, x)
+                  + iv_cell(cells, m, g, y + 1, x + 1);
             best[g] = max(best[g], v);
         }
     }
-    for (uint k = 0; k < 8u; ++k) { sums[k][tid] = own[k]; }
+    for (uint k = 0; k < 6u; ++k) { sums[k][tid] = own[k]; }
     for (uint g = 0; g < 3u; ++g) { combs[g][tid] = best[g]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = IV_THREADS / 2u; stride > 0u; stride >>= 1) {
         if (tid < stride) {
-            for (uint k = 0; k < 8u; ++k) { sums[k][tid] += sums[k][tid + stride]; }
+            for (uint k = 0; k < 6u; ++k) { sums[k][tid] += sums[k][tid + stride]; }
             for (uint g = 0; g < 3u; ++g) { combs[g][tid] = max(combs[g][tid], combs[g][tid + stride]); }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid != 0u) { return; }
-    if (m.reset != 0u) {
-        state[IV_LASTSCDIFF] = 0; state[IV_LASTN] = 0; state[IV_FIELD_END] = 0;
-        state[IV_START_SET] = 0; state[IV_START_PTS] = 0; state[IV_LAST_PTS] = 0; state[IV_LAST_DURATION] = 0;
-    }
     ulong a[6] = {sums[0][0], sums[1][0], sums[2][0], sums[3][0], sums[4][0], sums[5][0]};
-    long prevDiff = long(sums[6][0]), nextDiff = long(sums[7][0]);
     // Matches: 0 p, 1 c, 2 n.
     uint match = iv_compare(a, 1u, 0u);
-    bool sc = false;
-    if (state[IV_LASTN] == m.emitted - 1) {
-        if (state[IV_LASTSCDIFF] > m.scthresh) { sc = true; }
-    } else if (prevDiff > m.scthresh) {
-        sc = true;
-    }
-    if (!sc) {
-        state[IV_LASTN] = m.emitted;
-        state[IV_LASTSCDIFF] = nextDiff;
-        sc = nextDiff > m.scthresh;
-    }
     bool combed = false;
     if (sc) {
         // checkmm(match, n): the comb grids are the weaves p, c, n, by match.

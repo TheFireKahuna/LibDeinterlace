@@ -32,6 +32,8 @@ public protocol DeinterlacePass: AnyObject {
     func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int)
     func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize)
     func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize)
+    /// Threadgroups counted on the GPU: three 32-bit words at `offset` (a dimension of 0 dispatches nothing).
+    func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize)
     /// Every dispatch after this sees every write before it.
     func barrier()
 }

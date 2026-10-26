@@ -69,6 +69,10 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
         func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize) {
             encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threadsPerThreadgroup)
         }
+        func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize) {
+            encoder.dispatchThreadgroups(indirectBuffer: indirectBuffer, indirectBufferOffset: offset,
+                                         threadsPerThreadgroup: threadsPerThreadgroup)
+        }
         func barrier() { encoder.memoryBarrier(scope: [.buffers, .textures]) }
     }
 }
