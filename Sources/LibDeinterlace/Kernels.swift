@@ -6,12 +6,13 @@ import Foundation
 import Metal
 import os
 
-/// The library's GPU work. Each call runs kernels over pictures of one ``PictureLayout`` and returns exact integer
-/// results (sums totalled in 64 bits), or encodes into a caller's compute encoder (``encodeBwdif(_:layout:width:height:into:encoder:)``).
+/// The library's GPU work, submitted through the caller's ``DeinterlaceSubmission``. Each call runs kernels over
+/// pictures of one ``PictureLayout`` and returns exact integer results (sums totalled in 64 bits), or encodes into a
+/// caller's pass (``encodeBwdif(_:layout:width:height:into:pass:)``).
 public final class DeinterlaceKernels: @unchecked Sendable {
 
     public let device: MTLDevice
-    let queue: MTLCommandQueue
+    let submission: any DeinterlaceSubmission
 
     private static let libraries = OSAllocatedUnfairLock<[ObjectIdentifier: MTLLibrary]>(initialState: [:])
     private static let pipelines = OSAllocatedUnfairLock<[PipelineKey: MTLComputePipelineState]>(initialState: [:])
@@ -22,12 +23,9 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         let constants: [UInt32]
     }
 
-    public enum KernelError: Error { case unavailable(String) }
-
-    public init(device: MTLDevice) throws {
-        self.device = device
-        guard let queue = device.makeCommandQueue() else { throw KernelError.unavailable("no command queue") }
-        self.queue = queue
+    public init(submission: any DeinterlaceSubmission) {
+        self.submission = submission
+        device = submission.device
     }
 
     private static func library(for device: MTLDevice) throws -> MTLLibrary {
@@ -83,14 +81,14 @@ public final class DeinterlaceKernels: @unchecked Sendable {
     /// `out`: planes 0...2 (0 alone for grey), one byte a sample up to 8 bits and two above, little-endian. False when a
     /// picture breaks the layout's alignment or the pipeline cannot be made.
     public func encodeBwdif(_ field: BwdifField, layout: PictureLayout, width: Int, height: Int, into out: PlaneSet,
-                            encoder: MTLComputeCommandEncoder) -> Bool {
+                            pass: any DeinterlacePass) -> Bool {
         guard [field.prev, field.cur, field.next].allSatisfy(layout.fits),
               let pipeline = try? pipeline(for: layout, function: "pf_bwdif") else { return false }
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(field.prev.buffer, offset: 0, index: 0)
-        encoder.setBuffer(field.cur.buffer, offset: 0, index: 5)
-        encoder.setBuffer(field.next.buffer, offset: 0, index: 6)
-        encoder.setBuffer(out.buffer, offset: 0, index: 7)
+        pass.setPipeline(pipeline)
+        pass.setBuffer(field.prev.buffer, offset: 0, index: 0)
+        pass.setBuffer(field.cur.buffer, offset: 0, index: 5)
+        pass.setBuffer(field.next.buffer, offset: 0, index: 6)
+        pass.setBuffer(out.buffer, offset: 0, index: 7)
         let w = pipeline.threadExecutionWidth
         let group = MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1)
         for (c, component) in layout.components.enumerated() {
@@ -100,16 +98,16 @@ public final class DeinterlaceKernels: @unchecked Sendable {
             for picture in [field.prev, field.cur, field.next] { words += picture.offsets + picture.linesizes }
             words += [UInt32(cw), UInt32(ch), UInt32(c), field.parity, field.fieldParity, field.intra ? 1 : 0,
                       (1 << component.depth) - 1, out.offsets[c], out.linesizes[c], component.depth > 8 ? 1 : 0]
-            words.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
+            words.withUnsafeBytes { pass.setBytes($0, index: 1) }
             // One thread per four columns of a row pair.
-            encoder.dispatchThreads(MTLSize(width: (cw + 3) / 4, height: (ch + 1) / 2, depth: 1), threadsPerThreadgroup: group)
+            pass.dispatchThreads(MTLSize(width: (cw + 3) / 4, height: (ch + 1) / 2, depth: 1), threadsPerThreadgroup: group)
         }
         return true
     }
 
-    /// ``encodeBwdif(_:layout:width:height:into:encoder:)`` in a command buffer of its own, waited for.
+    /// ``encodeBwdif(_:layout:width:height:into:pass:)`` in a batch of its own, waited for.
     public func deinterlace(_ field: BwdifField, layout: PictureLayout, width: Int, height: Int, into out: PlaneSet) -> Bool {
-        run { encodeBwdif(field, layout: layout, width: width, height: height, into: out, encoder: $0) }
+        run { encodeBwdif(field, layout: layout, width: width, height: height, into: out, pass: $0) }
     }
 
     // MARK: - fieldmatch and decimate
@@ -123,23 +121,35 @@ public final class DeinterlaceKernels: @unchecked Sendable {
 
     private func words(_ p: PlaneSet) -> [UInt32] { p.offsets + p.linesizes }
 
-    private func run(_ encode: (MTLComputeCommandEncoder) -> Bool) -> Bool {
-        guard let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder() else { return false }
-        guard encode(encoder) else {
-            encoder.endEncoding()
+    /// `encode` in a batch of its own, committed and waited for: the calls that return results read them on the CPU.
+    /// A batch whose encoding fails is still committed (with the dispatches it has), so it is never left open.
+    private func run(_ encode: (any DeinterlacePass) -> Bool) -> Bool {
+        guard let batch = submission.makeBatch() else { return false }
+        guard let pass = batch.makePass() else {
+            commitAndWait(batch)
             return false
         }
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        return commands.status == .completed
+        let encoded = encode(pass)
+        return commitAndWait(batch) && encoded
     }
 
-    private func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState, width: Int, height: Int,
+    @discardableResult
+    private func commitAndWait(_ batch: any DeinterlaceBatch) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        let completed = OSAllocatedUnfairLock(initialState: false)
+        batch.commit { failure in
+            completed.withLock { $0 = failure == nil }
+            done.signal()
+        }
+        done.wait()
+        return completed.withLock { $0 }
+    }
+
+    private func dispatch(_ pass: any DeinterlacePass, _ pipeline: MTLComputePipelineState, width: Int, height: Int,
                           group: MTLSize? = nil) -> MTLSize {
         let w = pipeline.threadExecutionWidth
         let g = group ?? MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1)
-        encoder.dispatchThreads(MTLSize(width: max(width, 1), height: max(height, 1), depth: 1), threadsPerThreadgroup: g)
+        pass.dispatchThreads(MTLSize(width: max(width, 1), height: max(height, 1), depth: 1), threadsPerThreadgroup: g)
         return MTLSize(width: (max(width, 1) + g.width - 1) / g.width, height: (max(height, 1) + g.height - 1) / g.height, depth: 1)
     }
 
@@ -172,7 +182,7 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         }
         guard let partials = buffer(4 * partialLength) else { return nil }
         memset(partials.contents(), 0, partials.length)
-        let ok = run { encoder in
+        let ok = run { pass in
             for (c, s) in sizes.enumerated() {
                 let plane = [UInt32(s.width), UInt32(s.height), UInt32(c)]
                 let mapStart = mapFromNextField ? fbase1 + 2 : fbase1
@@ -180,27 +190,27 @@ public final class DeinterlaceKernels: @unchecked Sendable {
                 // FMDiffMap
                 var m = words(prev) + words(next) + plane
                 m += [UInt32(base1), UInt32(base2), UInt32(mapStart), UInt32(mapOffsets[c])]
-                encoder.setComputePipelineState(diffmap)
-                encoder.setBuffer(prev.buffer, offset: 0, index: 0)
-                encoder.setBuffer(next.buffer, offset: 0, index: 5)
-                encoder.setBuffer(map, offset: 0, index: 7)
-                m.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-                _ = dispatch(encoder, diffmap, width: s.width - 2, height: (s.height - 3) / 2)
+                pass.setPipeline(diffmap)
+                pass.setBuffer(prev.buffer, offset: 0, index: 0)
+                pass.setBuffer(next.buffer, offset: 0, index: 5)
+                pass.setBuffer(map, offset: 0, index: 7)
+                m.withUnsafeBytes { pass.setBytes($0, index: 1) }
+                _ = dispatch(pass, diffmap, width: s.width - 2, height: (s.height - 3) / 2)
             }
-            encoder.memoryBarrier(scope: .buffers)
+            pass.barrier()
             for (c, s) in sizes.enumerated() {
                 let startx = c == 0 ? 8 : 8 >> hsub
                 // FMCompare
                 var w = words(src) + words(prev) + words(next) + [UInt32(s.width), UInt32(s.height), UInt32(c)]
                 w += [UInt32(fbase1), UInt32(fbase2), UInt32(startx), UInt32(mapOffsets[c]), UInt32(partialOffsets[c])]
-                encoder.setComputePipelineState(accumulate)
-                encoder.setBuffer(src.buffer, offset: 0, index: 0)
-                encoder.setBuffer(prev.buffer, offset: 0, index: 5)
-                encoder.setBuffer(next.buffer, offset: 0, index: 6)
-                encoder.setBuffer(map, offset: 0, index: 7)
-                encoder.setBuffer(partials, offset: 0, index: 8)
-                w.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-                _ = dispatch(encoder, accumulate, width: s.width - 2 * startx, height: (s.height - 3) / 2, group: group)
+                pass.setPipeline(accumulate)
+                pass.setBuffer(src.buffer, offset: 0, index: 0)
+                pass.setBuffer(prev.buffer, offset: 0, index: 5)
+                pass.setBuffer(next.buffer, offset: 0, index: 6)
+                pass.setBuffer(map, offset: 0, index: 7)
+                pass.setBuffer(partials, offset: 0, index: 8)
+                w.withUnsafeBytes { pass.setBytes($0, index: 1) }
+                _ = dispatch(pass, accumulate, width: s.width - 2 * startx, height: (s.height - 3) / 2, group: group)
             }
             return true
         }
@@ -221,13 +231,13 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         // FMComb
         var w = words(src) + words(other) + [UInt32(width), UInt32(height), 0]
         w += [UInt32(srcParity), UInt32(bitPattern: Int32(cthresh)), UInt32(cellsX)]
-        let ok = run { encoder in
-            encoder.setComputePipelineState(comb)
-            encoder.setBuffer(src.buffer, offset: 0, index: 0)
-            encoder.setBuffer(other.buffer, offset: 0, index: 5)
-            encoder.setBuffer(cells, offset: 0, index: 8)
-            w.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-            _ = dispatch(encoder, comb, width: width, height: height - 2)
+        let ok = run { pass in
+            pass.setPipeline(comb)
+            pass.setBuffer(src.buffer, offset: 0, index: 0)
+            pass.setBuffer(other.buffer, offset: 0, index: 5)
+            pass.setBuffer(cells, offset: 0, index: 8)
+            w.withUnsafeBytes { pass.setBytes($0, index: 1) }
+            _ = dispatch(pass, comb, width: width, height: height - 2)
             return true
         }
         guard ok else { return nil }
@@ -253,13 +263,13 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         guard let out = buffer(4 * groups) else { return nil }
         memset(out.contents(), 0, out.length)
         let w = words(a) + words(b) + [UInt32(width), UInt32(height), 0, 0, 0, 0]
-        let ok = run { encoder in
-            encoder.setComputePipelineState(diff)
-            encoder.setBuffer(a.buffer, offset: 0, index: 0)
-            encoder.setBuffer(b.buffer, offset: 0, index: 5)
-            encoder.setBuffer(out, offset: 0, index: 8)
-            w.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-            _ = dispatch(encoder, diff, width: width, height: height, group: group)
+        let ok = run { pass in
+            pass.setPipeline(diff)
+            pass.setBuffer(a.buffer, offset: 0, index: 0)
+            pass.setBuffer(b.buffer, offset: 0, index: 5)
+            pass.setBuffer(out, offset: 0, index: 8)
+            w.withUnsafeBytes { pass.setBytes($0, index: 1) }
+            _ = dispatch(pass, diff, width: width, height: height, group: group)
             return true
         }
         guard ok else { return nil }
@@ -275,16 +285,16 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         memset(out.contents(), 0, out.length)
         let sizes = (0..<layout.components.count).map { layout.size(component: $0, width: width, height: height) }
         let hsub = Int(layout.log2ChromaW), vsub = Int(layout.log2ChromaH)
-        let ok = run { encoder in
-            encoder.setComputePipelineState(diff)
-            encoder.setBuffer(a.buffer, offset: 0, index: 0)
-            encoder.setBuffer(b.buffer, offset: 0, index: 5)
-            encoder.setBuffer(out, offset: 0, index: 8)
+        let ok = run { pass in
+            pass.setPipeline(diff)
+            pass.setBuffer(a.buffer, offset: 0, index: 0)
+            pass.setBuffer(b.buffer, offset: 0, index: 5)
+            pass.setBuffer(out, offset: 0, index: 8)
             for (c, s) in sizes.enumerated() {
                 let bw = c == 0 ? blockx / 2 : (blockx / 2) >> hsub, bh = c == 0 ? blocky / 2 : (blocky / 2) >> vsub
                 let w = words(a) + words(b) + [UInt32(s.width), UInt32(s.height), UInt32(c), UInt32(bw), UInt32(bh), UInt32(blocksX)]
-                w.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-                _ = dispatch(encoder, diff, width: s.width, height: s.height)
+                w.withUnsafeBytes { pass.setBytes($0, index: 1) }
+                _ = dispatch(pass, diff, width: s.width, height: s.height)
             }
             return true
         }
@@ -297,16 +307,16 @@ public final class DeinterlaceKernels: @unchecked Sendable {
     public func weave(src: PlaneSet, other: PlaneSet, srcParity: Int, layout: PictureLayout, width: Int, height: Int, into out: PlaneSet) -> Bool {
         guard let pipeline = try? pipeline(for: layout, function: "fm_weave_out") else { return false }
         let sizes = (0..<layout.components.count).map { layout.size(component: $0, width: width, height: height) }
-        return run { encoder in
-            encoder.setComputePipelineState(pipeline)
-            encoder.setBuffer(src.buffer, offset: 0, index: 0)
-            encoder.setBuffer(other.buffer, offset: 0, index: 5)
-            encoder.setBuffer(out.buffer, offset: 0, index: 7)
+        return run { pass in
+            pass.setPipeline(pipeline)
+            pass.setBuffer(src.buffer, offset: 0, index: 0)
+            pass.setBuffer(other.buffer, offset: 0, index: 5)
+            pass.setBuffer(out.buffer, offset: 0, index: 7)
             for (c, s) in sizes.enumerated() {
                 let w = words(src) + words(other) + [UInt32(s.width), UInt32(s.height), UInt32(c), UInt32(srcParity),
                                                      out.offsets[c], out.linesizes[c]]
-                w.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-                _ = dispatch(encoder, pipeline, width: s.width, height: s.height)
+                w.withUnsafeBytes { pass.setBytes($0, index: 1) }
+                _ = dispatch(pass, pipeline, width: s.width, height: s.height)
             }
             return true
         }

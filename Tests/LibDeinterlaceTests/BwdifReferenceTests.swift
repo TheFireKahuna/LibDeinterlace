@@ -240,7 +240,7 @@ struct BwdifReferenceTests {
 
     private static func gpu(_ frames: [UnsafeMutablePointer<AVFrame>], _ c: Case) throws -> [Picture] {
         let device = try #require(Pictures.device, "needs a Metal device")
-        let kernels = try DeinterlaceKernels(device: device)
+        let kernels = DeinterlaceKernels(submission: try #require(Metal3Submission(device: device)))
         let layout = try #require(PictureLayout(format: c.format))
         let window = BwdifWindow(timeBase: AVRational(num: 1, den: 25), fieldRate: c.fieldRate)
         var outputs: [BwdifWindow.Output] = []

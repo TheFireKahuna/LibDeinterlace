@@ -195,7 +195,7 @@ struct InverseTelecineReferenceTests {
 
     private static func gpu(_ frames: [[[UInt8]]], _ c: Case, _ layout: PictureLayout) throws -> [Output] {
         let device = try #require(Pictures.device, "needs a Metal device")
-        let kernels = try DeinterlaceKernels(device: device)
+        let kernels = DeinterlaceKernels(submission: try #require(Metal3Submission(device: device)))
         let chain = try #require(InverseTelecine(
             kernels: kernels,
             makePicture: { _, w, h in Pictures.planar(layout, width: w, height: h).map { ($0, {}) } },

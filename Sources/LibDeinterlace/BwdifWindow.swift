@@ -10,7 +10,7 @@ import AetherLibavutil
 
 /// Which deinterlaced pictures to make, and from what: libavfilter/yadif_common.c's scheduling (`ff_yadif_filter_frame`,
 /// `return_frame`, `ff_yadif_request_frame`), the part of FFmpeg's bwdif that is not per-sample arithmetic, with
-/// `deint=interlaced` and `parity=auto`. The arithmetic runs on the GPU (``DeinterlaceKernels/encodeBwdif(_:layout:width:height:into:encoder:)``); this says
+/// `deint=interlaced` and `parity=auto`. The arithmetic runs on the GPU (``DeinterlaceKernels/encodeBwdif(_:layout:width:height:into:pass:)``); this says
 /// which three pictures, which parities, which fields are intra, and the timestamps, as FFmpeg does:
 ///
 /// - A window of three pictures (previous, current, next). The first picture stands in for its own predecessor, and

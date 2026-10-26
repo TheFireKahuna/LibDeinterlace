@@ -13,7 +13,7 @@ every plane) to equal FFmpeg's on the same frames.
 
 | Part | Transcribes | What it gives |
 |---|---|---|
-| `DeinterlaceKernels.encodeBwdif` | `libavfilter/bwdifdsp.c`, `vf_bwdif.c` | one deinterlaced field, encoded into the caller's compute encoder |
+| `DeinterlaceKernels.encodeBwdif` | `libavfilter/bwdifdsp.c`, `vf_bwdif.c` | one deinterlaced field, encoded into the caller's compute pass |
 | `BwdifWindow` | `libavfilter/yadif_common.c` | which pictures, parities and timestamps each field takes (`deint=interlaced`, `parity=auto`, field or frame rate) |
 | `FieldMatcher` | `libavfilter/vf_fieldmatch.c` | the film frame each interlaced frame weaves into (defaults: `mode=pc_n`, `combmatch=sc`) |
 | `Decimator` | `libavfilter/vf_decimate.c` | one picture of five dropped, timestamps on the film rate (defaults: `cycle=5`) |
@@ -24,13 +24,20 @@ Pictures cross the interface as `PlaneSet` (a Metal buffer, plane offsets and li
 Pictures are held, never copied: a decoded picture by its frame reference, a woven or deinterlaced one in a buffer the
 caller supplies.
 
+The library owns no command queue. Its GPU work goes through the caller's submission (`DeinterlaceSubmission`, with
+`DeinterlaceBatch` and `DeinterlacePass`): `encodeBwdif` encodes into a pass of the caller's batch, so a deinterlaced
+field can share one submission with the caller's own passes, and the calls that return results (the field matcher's and
+decimator's sums, a woven picture) commit a batch of their own and wait for it. The protocols are bindings by index,
+pipelines, small constant arguments, dispatches and barriers, so a caller can implement them over Metal 4 or Metal 3.
+
 Scope is FFmpeg's: bwdif on the formats `vf_bwdif.c` takes (8 to 16 bits, 4:2:0, 4:2:2, 4:4:4, 4:1:1, 4:4:0, 4:1:0,
 grey 8 and 16; `BwdifWindow.referenceFormats`), field matching and decimation on 8-bit 4:4:4, 4:2:2, 4:2:0, 4:1:1 and
 4:1:0 (`InverseTelecine.takes`).
 
 ## Tests
 
-`swift test` on a Mac with a Metal device.
+`swift test` on a Mac with a Metal device. The tests submit through a Metal 3 implementation of the protocols
+(`Metal3Submission`).
 
 - `BwdifReferenceTests`: libavfilter's bwdif (from FFmpegBuild, in process) against the GPU on 30 cases: 8 to 16 bits,
   every subsampling, grey, NV12, P010, UYVY and big-endian sources, both field orders, field and frame rate, odd and
