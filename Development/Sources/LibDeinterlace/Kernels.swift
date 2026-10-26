@@ -33,8 +33,11 @@ public final class DeinterlaceKernels: @unchecked Sendable {
     static func library(for device: MTLDevice) throws -> MTLLibrary {
         if let cached = libraries.withLock({ $0[ObjectIdentifier(device)] }) { return cached }
         let made = try device.makeDefaultLibrary(bundle: .module)
-        libraries.withLock { $0[ObjectIdentifier(device)] = made }
-        return made
+        return libraries.withLock { cache in
+            if let first = cache[ObjectIdentifier(device)] { return first }
+            cache[ObjectIdentifier(device)] = made
+            return made
+        }
     }
 
     /// The pipelines translated ahead of time for the GPUs the bundle was built for (a tvOS device's: the A15's), which
@@ -66,8 +69,13 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         if let ready = Self.pipelines.withLock({ $0[key] }) { return ready }
         let made = try submission.makeComputePipeline(DeinterlacePipelineRequest(
             library: Self.library(for: device), function: name, constants: Self.constants(for: layout), archive: Self.archive))
-        Self.pipelines.withLock { $0[key] = made }
-        return made
+        // The first one made is every caller's: a pipeline another thread made meanwhile is dropped, never put in its
+        // place, as work already encoded holds the cached one without retaining it.
+        return Self.pipelines.withLock { cache in
+            if let first = cache[key] { return first }
+            cache[key] = made
+            return made
+        }
     }
 
     /// Every kernel the library runs on pictures of `format`: bwdif's for a format it deinterlaces, inverse telecine's
