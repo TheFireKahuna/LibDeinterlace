@@ -92,6 +92,9 @@ public final class InverseTelecine {
         let partials: MTLBuffer
         let stats: MTLBuffer
         let blocks: MTLBuffer
+        /// Updated once the chain work of the push that last took this set has read it: the next push to take it
+        /// writes only after that, however far its statistics run ahead.
+        let released: MTLFence
     }
     private let scratch: [Scratch]
     private var nextScratch = 0
@@ -180,9 +183,10 @@ public final class InverseTelecine {
                   let partials = device.makeBuffer(length: 4 * max(sizes.partials, 4), options: .storageModePrivate),
                   let stats = device.makeBuffer(length: 4 * DeinterlaceKernels.statisticsLength(cells: cells.x * cells.y),
                                                 options: .storageModePrivate),
-                  let blocks = device.makeBuffer(length: 4 * nxblocks * nyblocks, options: .storageModePrivate)
+                  let blocks = device.makeBuffer(length: 4 * nxblocks * nyblocks, options: .storageModePrivate),
+                  let released = device.makeFence()
             else { return nil }
-            sets.append(Scratch(map: map, partials: partials, stats: stats, blocks: blocks))
+            sets.append(Scratch(map: map, partials: partials, stats: stats, blocks: blocks, released: released))
         }
         scratch = sets
     }
@@ -212,9 +216,9 @@ public final class InverseTelecine {
     }
 
     /// Feeds a decoded picture (nil: end of stream), encoding its work into two passes of `batch`, and returns the film
-    /// pictures it releases. The first reads only decoded pictures, so it may run beside earlier batches' work; the
-    /// second waits for it and for the previous push's chain work (``fence``), and updates ``fence`` when done. Pushes
-    /// are committed in order to one queue.
+    /// pictures it releases. The first reads only decoded pictures, so it may run beside earlier batches' work (once
+    /// the push that last used its working buffers has read them); the second waits for it and for the previous push's
+    /// chain work (``fence``), and updates ``fence`` when done. Pushes are committed in order to one queue.
     public func push(_ picture: BwdifWindow.Picture?, into batch: any DeinterlaceBatch) -> Pushed {
         var pushed = Pushed()
         let work = scratch[nextScratch]
@@ -222,13 +226,18 @@ public final class InverseTelecine {
         let compared = window3(picture)
         if let compared {
             pushed.touched += [compared.prv, compared.src, compared.nxt]
-            guard let first = batch.makePass(), statistics(compared, work: work, pass: first) else { return pushed }
+            guard let first = batch.makePass() else { return pushed }
+            first.waitForFence(work.released)
+            guard statistics(compared, work: work, pass: first) else { return pushed }
             first.updateFence(statistics)
         }
         guard let pass = batch.makePass() else { return pushed }
         pass.waitForFence(statistics)
         pass.waitForFence(fence)
-        defer { pass.updateFence(fence) }
+        defer {
+            pass.updateFence(work.released)
+            pass.updateFence(fence)
+        }
         if let compared, let matched = match(compared, work: work, pass: pass, pushed: &pushed),
            let out = window(matched, finishing: false, pass: pass, pushed: &pushed) {
             decimate(out, work: work, pass: pass, pushed: &pushed)
