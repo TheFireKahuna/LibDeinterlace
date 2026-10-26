@@ -239,7 +239,7 @@ struct InverseTelecineReferenceTests {
         return outputs.compactMap { output in
             chain.resolve(output).map { pts in
                 Output(time: (pts * Int64(tb.num), Int64(tb.den)),
-                       samples: Pictures.samples(output.picture.storage.planes, layout, width: c.width, height: c.height))
+                       samples: Pictures.samples(chain.shown(output).storage.planes, layout, width: c.width, height: c.height))
             }
         }
     }

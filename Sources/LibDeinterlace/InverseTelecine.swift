@@ -33,13 +33,23 @@ public final class InverseTelecine {
         return height % 2 == 0 && ch % 2 == 0 && ch >= 8 && width >= 32
     }
 
-    /// Makes an empty picture of the stream's format and size (a slab of the caller's), with what returns it.
+    /// Makes an empty picture of the stream's format and size (a slab of the caller's), with what returns it. Every
+    /// picture it makes has the same plane offsets and linesizes: a reader of a window output binds two pictures and
+    /// takes one layout for both. A picture of another layout is refused (nil from the push that needed it).
     public typealias PictureMaker = (AVPixelFormat, Int, Int) -> (planes: PlaneSet, release: () -> Void)?
 
-    /// A film picture the chain puts out: written by the work of the pass it came from. Whether it goes out, and at what
-    /// timestamp, is ``resolve(_:)``'s once that work has completed.
+    /// A film picture the chain puts out, decided on the GPU by the work of the pass it came from. Its pixels are bwdif's
+    /// `picture`, or, when the window passed the weave through, `passthrough`, which bwdif then never writes: a reader
+    /// binds both and chooses by `passedThrough` (one layout serves both, ``PictureMaker``), and on the CPU
+    /// ``shown(_:)`` says which. Whether it goes out, and at what timestamp, is ``resolve(_:)``'s once that work has
+    /// completed.
     public struct Output {
+        /// bwdif's picture, which also carries the output's frame properties.
         public let picture: BwdifWindow.Picture
+        /// The weave, the output's pixels when bwdif passed it through.
+        public let passthrough: BwdifWindow.Picture
+        /// A 32-bit word, nonzero when the output is `passthrough`, written before the output is put out.
+        public let passedThrough: (buffer: MTLBuffer, offset: Int)
         let fixedPTS: Int64?
         let result: Int?
         /// Where the GPU writes whether decimate keeps the picture: a 64-bit word, 1 kept and 0 dropped, written by the
@@ -48,8 +58,21 @@ public final class InverseTelecine {
         public let kept: (buffer: MTLBuffer, offset: Int)?
     }
 
+    /// Where an output's pixels are, once the pass that put it out has completed: `picture` or `passthrough`.
+    public func shown(_ output: Output) -> BwdifWindow.Picture {
+        output.passedThrough.buffer.contents().load(fromByteOffset: output.passedThrough.offset, as: UInt32.self) != 0
+            ? output.passthrough : output.picture
+    }
+
+    /// A record's bytes in the ring (the shader's IVRecord), and where in it bwdif's passthrough flag and threadgroup
+    /// counts are.
+    static let recordStride = 32
+    static let recordPassthrough = 8
+    static let recordGroups = 16
+
     /// What one ``push(_:into:)`` encoded: the pictures it puts out, and every picture its work reads or writes, which
-    /// the caller holds until the pass has completed.
+    /// the caller holds until the pass has completed. An output's `picture` and `passthrough` are held as long as work
+    /// reading the output may run.
     public struct Pushed {
         public var outputs: [Output] = []
         public var touched: [BwdifWindow.Picture] = []
@@ -65,6 +88,10 @@ public final class InverseTelecine {
     let width: Int
     let height: Int
     private let decimates: Bool
+    /// bwdif's threadgroups for a picture the window deinterlaces, which its decision writes into the record.
+    private let bwdifGroups: MTLSize
+    /// The layout every picture made has (``PictureMaker``): the first one's.
+    private var madeLayout: PlaneSet?
 
     /// The time base of every output timestamp: decimate's (the input frame period times 5/4), or bwdif's (half the
     /// input's) without decimation.
@@ -138,8 +165,25 @@ public final class InverseTelecine {
     private let decimateSCThresh: Int64
     private let nxblocks: Int
     private let nyblocks: Int
-    private var queue: [(picture: BwdifWindow.Picture, pts: Int64)] = []
-    private var last: BwdifWindow.Picture?
+    private var queue: [(picture: WindowOutput, pts: Int64)] = []
+    private var last: WindowOutput?
+
+    /// A window output: bwdif's picture, or the weave of `record` when its decision passes it through.
+    private struct WindowOutput {
+        let picture: BwdifWindow.Picture
+        let weave: BwdifWindow.Picture
+        let record: UInt32
+
+        var onGPU: DeinterlaceKernels.WindowPicture {
+            .init(bwdif: picture.storage.planes, weave: weave.storage.planes, record: record)
+        }
+    }
+
+    private func output(_ w: WindowOutput, fixedPTS: Int64?, result: Int?, kept: (buffer: MTLBuffer, offset: Int)?) -> Output {
+        Output(picture: w.picture, passthrough: w.weave,
+               passedThrough: (records, Self.recordStride * Int(w.record) + Self.recordPassthrough),
+               fixedPTS: fixedPTS, result: result, kept: kept)
+    }
 
     /// `timeBase` is the decoded pictures'; `frameRate` the carriage rate (decimate needs a constant one). Without
     /// `decimates` (2:2, progressive-segmented film) every matched picture goes out.
@@ -147,8 +191,10 @@ public final class InverseTelecine {
                  height: Int, timeBase: AVRational, frameRate: AVRational, decimates: Bool = true) {
         guard Self.takes(format: format, width: width, height: height), frameRate.num > 0, frameRate.den > 0,
               let layout = PictureLayout(format: format),
-              let sizes = kernels.fieldMatchSizes(layout: layout, width: width, height: height, hsub: Int(layout.log2ChromaW))
+              let sizes = kernels.fieldMatchSizes(layout: layout, width: width, height: height, hsub: Int(layout.log2ChromaW)),
+              let bwdif = kernels.bwdifDispatch(layout: layout, width: width, height: height)
         else { return nil }
+        bwdifGroups = bwdif.groups
         self.kernels = kernels
         self.makeBuffer = makePicture
         self.layout = layout
@@ -171,7 +217,7 @@ public final class InverseTelecine {
         partialCount = sizes.partials
         let device = kernels.device
         guard let state = device.makeBuffer(length: 8 * State.words, options: .storageModeShared),
-              let records = device.makeBuffer(length: 16 * Self.recordRing, options: .storageModeShared),
+              let records = device.makeBuffer(length: Self.recordStride * Self.recordRing, options: .storageModeShared),
               let results = device.makeBuffer(length: 16 * Self.resultRing, options: .storageModeShared) else { return nil }
         guard let statistics = device.makeFence(), let fence = device.makeFence() else { return nil }
         memset(state.contents(), 0, state.length)
@@ -284,7 +330,14 @@ public final class InverseTelecine {
 
     /// An empty picture in a slab with `props`'s properties, flagged progressive: the weaves and bwdif's outputs.
     private func makePicture(props: UnsafePointer<AVFrame>, pts: Int64) -> (BwdifWindow.Picture, PlaneSet)? {
-        guard let made = makeBuffer(format, width, height), let frame = av_frame_alloc() else { return nil }
+        guard let made = makeBuffer(format, width, height) else { return nil }
+        let layout = madeLayout ?? made.planes
+        guard made.planes.offsets == layout.offsets, made.planes.linesizes == layout.linesizes,
+              let frame = av_frame_alloc() else {
+            made.release()
+            return nil
+        }
+        madeLayout = layout
         _ = av_frame_copy_props(frame, props)
         frame.pointee.format = format.rawValue
         frame.pointee.width = Int32(width)
@@ -353,7 +406,7 @@ public final class InverseTelecine {
         pass.barrier()
         guard kernels.encodeMatchDecide(partials: work.partials, partialCount: partialCount, stats: work.stats, cells: cells,
                                         state: state, records: records, record: record, window: windowArguments,
-                                        layout: layout, pass: pass) else { return nil }
+                                        bwdifGroups: bwdifGroups, layout: layout, pass: pass) else { return nil }
         pass.barrier()
         guard kernels.encodeWeave(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
                                   srcParity: 1 - field, records: records, record: record, layout: layout, width: width,
@@ -378,7 +431,7 @@ public final class InverseTelecine {
     /// ff_yadif_filter_frame at frame rate: the window slides and, once full, the current picture goes out, decided on
     /// the GPU (passed through, or its first field deinterlaced). The decision was made with the match (or, at the end,
     /// by iv_window_end); this encodes bwdif after it.
-    private func window(_ m: Matched, finishing: Bool, pass: any DeinterlacePass, pushed: inout Pushed) -> (BwdifWindow.Picture, Int64)? {
+    private func window(_ m: Matched, finishing: Bool, pass: any DeinterlacePass, pushed: inout Pushed) -> (WindowOutput, Int64)? {
         windowPrev = windowCur
         windowCur = windowNext
         windowNext = m
@@ -391,7 +444,8 @@ public final class InverseTelecine {
         if finishing {
             guard kernels.encodeWindowEnd(prev: prev.record, cur: cur.record, prevRepeat: prev.picture.repeatPict,
                                           curRepeat: cur.picture.repeatPict, start: windowStartPending, state: state,
-                                          records: records, layout: layout, pass: pass) else { return nil }
+                                          records: records, bwdifGroups: bwdifGroups, layout: layout, pass: pass)
+            else { return nil }
             pass.barrier()
         }
         windowStartPending = false
@@ -407,25 +461,26 @@ public final class InverseTelecine {
         guard kernels.encodeBwdif(field, layout: layout, width: width, height: height, into: planes,
                                   decided: (records, cur.record), pass: pass) else { return nil }
         pass.barrier()
+        let made = WindowOutput(picture: out, weave: cur.picture, record: cur.record)
         guard decimates else {
-            pushed.outputs.append(Output(picture: out, fixedPTS: pts, result: nil, kept: nil))
+            pushed.outputs.append(output(made, fixedPTS: pts, result: nil, kept: nil))
             return nil
         }
-        return (out, pts)
+        return (made, pts)
     }
 
     // MARK: decimate
 
     /// filter_frame with a picture: its differences from the one before into the cycle's slot, and at the end of a cycle
     /// the drop and the timestamps.
-    private func decimate(_ item: (BwdifWindow.Picture, Int64), work: Scratch, pass: any DeinterlacePass, pushed: inout Pushed) {
+    private func decimate(_ item: (WindowOutput, Int64), work: Scratch, pass: any DeinterlacePass, pushed: inout Pushed) {
         let (picture, pts) = item
         let slot = queue.count
         let prv = queue.last?.picture ?? last
         queue.append((picture, pts))
         if let prv {
-            pushed.touched.append(prv)
-            guard kernels.encodeBlockDiffs(prv.storage.planes, picture.storage.planes, layout: layout, width: width,
+            pushed.touched += [prv.picture, prv.weave]
+            guard kernels.encodeBlockDiffs(prv.onGPU, picture.onGPU, records: records, layout: layout, width: width,
                                            height: height, blockx: Decimator.blockx, blocky: Decimator.blocky,
                                            blocksX: nxblocks, blocksY: nyblocks, into: work.blocks, pass: pass) else { return }
             pass.barrier()
@@ -452,8 +507,7 @@ public final class InverseTelecine {
                                    state: state, results: results, layout: layout, pass: pass)
         pass.barrier()
         for (i, item) in queue.enumerated() {
-            pushed.outputs.append(Output(picture: item.picture, fixedPTS: nil, result: base + i,
-                                         kept: (results, 16 * (base + i) + 8)))
+            pushed.outputs.append(output(item.picture, fixedPTS: nil, result: base + i, kept: (results, 16 * (base + i) + 8)))
         }
         queue.removeAll()
     }

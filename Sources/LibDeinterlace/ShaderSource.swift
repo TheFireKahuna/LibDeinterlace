@@ -173,13 +173,16 @@ static inline void pf_bw_write(device uchar* out, constant PFBwdif& b, uint x, u
 struct IVRecord {
     uint match;          // 0 p, 1 c, 2 n
     uint combed;         // fieldmatch's combed verdict: the weave goes out flagged interlaced
-    uint passthrough;    // bwdif left the picture as it is
+    uint passthrough;    // bwdif left the picture as it is: the weave is the window's output, bwdif's never written
     uint intra;          // bwdif's first field after the start: FILTER_INTRA
+    uint groups[3];      // bwdif's threadgroups for the picture (its indirect dispatch): none when passed through
+    uint pad;
 };
 
 // One thread per four columns of a row pair: the current field's row, copied, and the row between, interpolated.
 // Four adjacent samples share every row of their window, so its loads come from the same cache lines. A decided
-// dispatch (inverse telecine) copies the current picture where the window decision left it as it is.
+// dispatch (inverse telecine) runs only for a picture the window decision deinterlaces (its threadgroups are the
+// record's), and takes intra from the record.
 //
 // Every component in one dispatch, the component the grid's third axis.
 struct PFBwdifs {
@@ -199,7 +202,6 @@ kernel void pf_bwdif(device const uchar*     prev    [[buffer(0)]],
     uint kept = 2u * gid.y + b.parity;
     uint interpolated = 2u * gid.y + (b.parity ^ 1u);
     uint n = min(4u, b.width - x0);
-    bool copy = b.decided != 0u && records[b.record].passthrough != 0u;
     uint intra = b.decided != 0u ? records[b.record].intra : b.intra;
     for (uint i = 0u; i < n; ++i) {
         uint x = x0 + i;
@@ -207,9 +209,7 @@ kernel void pf_bwdif(device const uchar*     prev    [[buffer(0)]],
             pf_bw_write(out, b, x, kept, pf_bw_read(cur, b.cur, b.component, x, int(kept)));
         }
         if (interpolated < b.height) {
-            int v = copy ? pf_bw_read(cur, b.cur, b.component, x, int(interpolated))
-                         : pf_bw_sample(prev, cur, next, b, intra, x, int(interpolated));
-            pf_bw_write(out, b, x, interpolated, v);
+            pf_bw_write(out, b, x, interpolated, pf_bw_sample(prev, cur, next, b, intra, x, int(interpolated)));
         }
     }
 }
@@ -580,6 +580,7 @@ struct IVMatch {
     uint prev_repeat;
     uint next_repeat;
     uint window_start;   // the window's first output since the start: its first deinterlaced field is intra
+    uint bwdif_groups[3];  // bwdif's threadgroups for a picture the window deinterlaces
 };
 
 // vf_fieldmatch.c compare_fields' decision from its six accumulations, between match1 and match2.
@@ -612,13 +613,14 @@ static inline uint iv_compare(thread const ulong* a, uint match1, uint match2) {
 // intra while the stream's start is pending (YADIF_FIELD_END, which the window's first picture sets; the end of the
 // stream replaces it, YADIF_FIELD_BACK_END).
 static inline void iv_window(device long* state, device IVRecord* records, uint prev, uint cur, uint next,
-                             bool prev_repeat, bool next_repeat, bool start, bool finishing) {
+                             bool prev_repeat, bool next_repeat, bool start, bool finishing, constant uint* groups) {
     if (start) { state[IV_FIELD_END] = 1; }
     if (finishing) { state[IV_FIELD_END] = 0; }
     bool pass = records[cur].combed == 0u || (records[prev].combed == 0u && prev_repeat)
              || (records[next].combed == 0u && next_repeat);
     records[cur].passthrough = pass ? 1u : 0u;
     records[cur].intra = !pass && state[IV_FIELD_END] != 0 ? 1u : 0u;
+    for (uint i = 0u; i < 3u; ++i) { records[cur].groups[i] = pass ? 0u : groups[i]; }
     if (!pass) { state[IV_FIELD_END] = 0; }
 }
 
@@ -674,10 +676,14 @@ kernel void iv_match_decide(device const uint*  partials [[buffer(0)]],
         if ((c2 * 3 < c1 || (c2 * 2 < c1 && c1 > 80)) && abs(c2 - c1) >= 30 && c2 < 80) { match = 2u; }
         combed = combs[match][0] >= 80;
     }
-    records[m.record] = IVRecord{match, combed ? 1u : 0u, 0u, 0u};
+    // The window's fields are its decision's, taken once this picture is its current one.
+    records[m.record].match = match;
+    records[m.record].combed = combed ? 1u : 0u;
+    records[m.record].passthrough = 0u;
+    records[m.record].intra = 0u;
     if (m.window != 0u) {
         iv_window(state, records, m.window_prev, m.window_cur, m.record, m.prev_repeat != 0u, m.next_repeat != 0u,
-                  m.window_start != 0u, false);
+                  m.window_start != 0u, false, m.bwdif_groups);
     }
 }
 
@@ -688,12 +694,13 @@ struct IVWindowEnd {
     uint prev_repeat;
     uint cur_repeat;
     uint start;
+    uint bwdif_groups[3];
 };
 
 kernel void iv_window_end(constant IVWindowEnd&  w       [[buffer(1)]],
                           device long*           state   [[buffer(7)]],
                           device IVRecord*       records [[buffer(8)]]) {
-    iv_window(state, records, w.prev, w.cur, w.cur, w.prev_repeat != 0u, w.cur_repeat != 0u, w.start != 0u, true);
+    iv_window(state, records, w.prev, w.cur, w.cur, w.prev_repeat != 0u, w.cur_repeat != 0u, w.start != 0u, true, w.bwdif_groups);
 }
 
 // create_weave_frame of the match the record holds, every plane in one dispatch: c is the picture itself, p and n take
@@ -743,21 +750,30 @@ struct IVBlocksPlane {
     uint block_h;
 };
 
+// `a` and `b` are window outputs: each is bwdif's picture, or the weave its record says bwdif passed through (the same
+// layout, so one PFPicture serves either).
 struct IVBlocks {
     PFPicture a;
     PFPicture b;
     IVBlocksPlane plane[3];
     uint planes;
     uint blocks_x;
+    uint a_record;
+    uint b_record;
 };
 
-kernel void iv_blocks(device const uchar*  ab     [[buffer(0)]],
-                      constant IVBlocks&   d      [[buffer(1)]],
-                      device const uchar*  bb     [[buffer(5)]],
-                      device uint*         blocks [[buffer(8)]],
-                      uint2                tid2   [[thread_position_in_threadgroup]],
-                      uint2                tgid   [[threadgroup_position_in_grid]],
-                      uint                 tindex [[thread_index_in_threadgroup]]) {
+kernel void iv_blocks(device const uchar*     abwdif  [[buffer(0)]],
+                      constant IVBlocks&      d       [[buffer(1)]],
+                      device const uchar*     aweave  [[buffer(2)]],
+                      device const IVRecord*  records [[buffer(3)]],
+                      device const uchar*     bbwdif  [[buffer(5)]],
+                      device const uchar*     bweave  [[buffer(6)]],
+                      device uint*            blocks  [[buffer(8)]],
+                      uint2                   tid2    [[thread_position_in_threadgroup]],
+                      uint2                   tgid    [[threadgroup_position_in_grid]],
+                      uint                    tindex  [[thread_index_in_threadgroup]]) {
+    device const uchar* ab = records[d.a_record].passthrough != 0u ? aweave : abwdif;
+    device const uchar* bb = records[d.b_record].passthrough != 0u ? bweave : bbwdif;
     threadgroup atomic_uint sum;
     if (tindex == 0u) { atomic_store_explicit(&sum, 0u, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);

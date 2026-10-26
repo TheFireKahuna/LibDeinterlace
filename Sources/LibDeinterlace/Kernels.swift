@@ -85,8 +85,23 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         encodeBwdif(field, layout: layout, width: width, height: height, into: out, decided: nil, pass: pass)
     }
 
-    /// `decided`: inverse telecine's record ring and the picture's record, which say whether to deinterlace and whether
-    /// the field is intra (iv_window_decide), in place of `field.intra`.
+    /// bwdif's dispatch for pictures of `layout` at `width` x `height`: one thread per four columns of a row pair, every
+    /// component on the grid's third axis, as threadgroups (the kernel bounds every axis).
+    func bwdifDispatch(layout: PictureLayout, width: Int, height: Int) -> (groups: MTLSize, threads: MTLSize)? {
+        guard let pipeline = try? pipeline(for: layout, function: "pf_bwdif") else { return nil }
+        var grid = (width: 1, height: 1)
+        for c in 0..<layout.components.count {
+            let (cw, ch) = layout.size(component: c, width: width, height: height)
+            grid = (max(grid.width, (cw + 3) / 4), max(grid.height, (ch + 1) / 2))
+        }
+        let w = pipeline.threadExecutionWidth
+        let threads = MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1)
+        return (MTLSize(width: (grid.width + threads.width - 1) / threads.width,
+                        height: (grid.height + threads.height - 1) / threads.height, depth: layout.components.count), threads)
+    }
+
+    /// `decided`: inverse telecine's record ring and the picture's record, which hold bwdif's threadgroups (none when
+    /// the window decision passes the picture through) and whether the field is intra, in place of `field.intra`.
     func encodeBwdif(_ field: BwdifField, layout: PictureLayout, width: Int, height: Int, into out: PlaneSet,
                      decided: (records: MTLBuffer, record: UInt32)?, pass: any DeinterlacePass) -> Bool {
         guard [field.prev, field.cur, field.next].allSatisfy(layout.fits),
@@ -98,23 +113,24 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         pass.setBuffer(field.next.buffer, offset: 0, index: 6)
         pass.setBuffer(out.buffer, offset: 0, index: 7)
         // PFBwdifs: per component, three PFPictures (offsets, linesizes), then the component's values.
+        guard let dispatch = bwdifDispatch(layout: layout, width: width, height: height) else { return false }
         var arguments = Arguments()
-        var grid = (width: 1, height: 1)
         for c in 0..<3 {
             let component = c < layout.components.count ? layout.components[c] : layout.components[0]
             let (cw, ch) = c < layout.components.count ? layout.size(component: c, width: width, height: height) : (0, 0)
-            grid = (max(grid.width, (cw + 3) / 4), max(grid.height, (ch + 1) / 2))
             for picture in [field.prev, field.cur, field.next] { arguments.words(picture.offsets + picture.linesizes) }
             arguments.words([UInt32(cw), UInt32(ch), UInt32(min(c, layout.components.count - 1)), field.parity,
                              field.fieldParity, field.intra ? 1 : 0, (1 << component.depth) - 1, out.offsets[c],
                              out.linesizes[c], component.depth > 8 ? 1 : 0, decided == nil ? 0 : 1, decided?.record ?? 0])
         }
         arguments.bind(pass, index: 1)
-        // One thread per four columns of a row pair.
-        let w = pipeline.threadExecutionWidth
-        pass.dispatchThreads(MTLSize(width: grid.width, height: grid.height, depth: layout.components.count),
-                             threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w),
-                                                            depth: 1))
+        if let decided {
+            pass.dispatchThreadgroups(indirectBuffer: decided.records,
+                                      offset: InverseTelecine.recordStride * Int(decided.record) + InverseTelecine.recordGroups,
+                                      threadsPerThreadgroup: dispatch.threads)
+        } else {
+            pass.dispatchThreadgroups(dispatch.groups, threadsPerThreadgroup: dispatch.threads)
+        }
         return true
     }
 
@@ -355,11 +371,11 @@ public final class DeinterlaceKernels: @unchecked Sendable {
     func encodeMatchDecide(partials: MTLBuffer, partialCount: Int, stats: MTLBuffer, cells: (x: Int, y: Int), state: MTLBuffer,
                            records: MTLBuffer, record: UInt32,
                            window: (prev: UInt32, cur: UInt32, prevRepeat: Bool, nextRepeat: Bool, start: Bool)?,
-                           layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
+                           bwdifGroups: MTLSize, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
         var arguments = Arguments()
         arguments.words([UInt32(partialCount), UInt32(cells.x), UInt32(cells.y), record, window == nil ? 0 : 1,
                          window?.prev ?? 0, window?.cur ?? 0, window?.prevRepeat == true ? 1 : 0, window?.nextRepeat == true ? 1 : 0,
-                         window?.start == true ? 1 : 0])
+                         window?.start == true ? 1 : 0] + Self.words(bwdifGroups))
         let cellCount = cells.x * cells.y
         return encodeDecision("iv_match_decide", layout: layout, pass: pass) { pass in
             pass.setBuffer(partials, offset: 0, index: 0)
@@ -373,10 +389,10 @@ public final class DeinterlaceKernels: @unchecked Sendable {
 
     /// bwdif's window decision for the stream's last picture, standing in for its own successor (iv_window_end).
     func encodeWindowEnd(prev: UInt32, cur: UInt32, prevRepeat: Bool, curRepeat: Bool, start: Bool, state: MTLBuffer,
-                         records: MTLBuffer, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
+                         records: MTLBuffer, bwdifGroups: MTLSize, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
         guard let end = try? pipeline(for: layout, function: "iv_window_end") else { return false }
         var arguments = Arguments()
-        arguments.words([prev, cur, prevRepeat ? 1 : 0, curRepeat ? 1 : 0, start ? 1 : 0])
+        arguments.words([prev, cur, prevRepeat ? 1 : 0, curRepeat ? 1 : 0, start ? 1 : 0] + Self.words(bwdifGroups))
         pass.setPipeline(end)
         pass.setBuffer(state, offset: 0, index: 7)
         pass.setBuffer(records, offset: 0, index: 8)
@@ -410,24 +426,38 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         return true
     }
 
+    private static func words(_ size: MTLSize) -> [UInt32] { [UInt32(size.width), UInt32(size.height), UInt32(size.depth)] }
+
+    /// A window output on the GPU: bwdif's picture, or the weave when the record says bwdif passed it through.
+    struct WindowPicture {
+        let bwdif: PlaneSet
+        let weave: PlaneSet
+        let record: UInt32
+    }
+
     /// calc_diffs' block sums of `a` against `b`, every plane (iv_blocks): one threadgroup per block of half `blockx` x
-    /// half `blocky` luma samples, on the luma grid of `blocksX` x `blocksY`.
-    func encodeBlockDiffs(_ a: PlaneSet, _ b: PlaneSet, layout: PictureLayout, width: Int, height: Int, blockx: Int, blocky: Int,
-                          blocksX: Int, blocksY: Int, into blocks: MTLBuffer, pass: any DeinterlacePass) -> Bool {
+    /// half `blocky` luma samples, on the luma grid of `blocksX` x `blocksY`. Each picture is read from the buffer its
+    /// record chose.
+    func encodeBlockDiffs(_ a: WindowPicture, _ b: WindowPicture, records: MTLBuffer, layout: PictureLayout, width: Int,
+                          height: Int, blockx: Int, blocky: Int, blocksX: Int, blocksY: Int, into blocks: MTLBuffer,
+                          pass: any DeinterlacePass) -> Bool {
         guard let sums = try? pipeline(for: layout, function: "iv_blocks") else { return false }
         let planes = layout.components.count
         let hsub = Int(layout.log2ChromaW), vsub = Int(layout.log2ChromaH)
         var arguments = Arguments()
-        arguments.words(words(a) + words(b))
+        arguments.words(words(a.bwdif) + words(b.bwdif))
         for c in 0..<3 {
             let s = c < planes ? layout.size(component: c, width: width, height: height) : (width: 0, height: 0)
             let bw = c == 0 ? blockx / 2 : (blockx / 2) >> hsub, bh = c == 0 ? blocky / 2 : (blocky / 2) >> vsub
             arguments.words([UInt32(s.width), UInt32(s.height), UInt32(min(c, planes - 1)), UInt32(bw), UInt32(bh)])
         }
-        arguments.words([UInt32(planes), UInt32(blocksX)])
+        arguments.words([UInt32(planes), UInt32(blocksX), a.record, b.record])
         pass.setPipeline(sums)
-        pass.setBuffer(a.buffer, offset: 0, index: 0)
-        pass.setBuffer(b.buffer, offset: 0, index: 5)
+        pass.setBuffer(a.bwdif.buffer, offset: 0, index: 0)
+        pass.setBuffer(a.weave.buffer, offset: 0, index: 2)
+        pass.setBuffer(records, offset: 0, index: 3)
+        pass.setBuffer(b.bwdif.buffer, offset: 0, index: 5)
+        pass.setBuffer(b.weave.buffer, offset: 0, index: 6)
         pass.setBuffer(blocks, offset: 0, index: 8)
         arguments.bind(pass, index: 1)
         pass.dispatchThreadgroups(MTLSize(width: blocksX, height: blocksY, depth: 1),
