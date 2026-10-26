@@ -101,14 +101,17 @@ public final class BwdifWindow {
 
     public init(timeBase: AVRational, fieldRate: Bool) {
         self.fieldRate = fieldRate
+        (outputTimeBase, ptsMultiplier) = Self.outputTimeBase(for: timeBase)
+    }
+
+    /// The output time base for input on `timeBase`, and the factor that takes an input timestamp onto it: the input
+    /// base halved, or the input base itself when the halved one does not reduce into 32 bits.
+    static func outputTimeBase(for timeBase: AVRational) -> (AVRational, Int64) {
         var num: Int32 = 0, den: Int32 = 0
         if av_reduce(&num, &den, Int64(timeBase.num), Int64(timeBase.den) * 2, Int64(Int32.max)) != 0 {
-            outputTimeBase = AVRational(num: num, den: den)
-            ptsMultiplier = 2
-        } else {
-            outputTimeBase = timeBase
-            ptsMultiplier = 1
+            return (AVRational(num: num, den: den), 2)
         }
+        return (timeBase, 1)
     }
 
     /// Whether a picture is held: once engaged, every picture goes through the window.

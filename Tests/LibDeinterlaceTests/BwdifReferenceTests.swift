@@ -240,7 +240,8 @@ struct BwdifReferenceTests {
 
     private static func gpu(_ frames: [UnsafeMutablePointer<AVFrame>], _ c: Case) throws -> [Picture] {
         let device = try #require(Pictures.device, "needs a Metal device")
-        let kernels = DeinterlaceKernels(submission: try #require(Metal3Submission(device: device)))
+        let gpu = try #require(Metal3Submission(device: device))
+        let kernels = DeinterlaceKernels(submission: gpu)
         let layout = try #require(PictureLayout(format: c.format))
         let window = BwdifWindow(timeBase: AVRational(num: 1, den: 25), fieldRate: c.fieldRate)
         var outputs: [BwdifWindow.Output] = []
@@ -259,7 +260,8 @@ struct BwdifReferenceTests {
                 let field = DeinterlaceKernels.BwdifField(prev: prev.storage.planes, cur: cur.storage.planes,
                                                           next: next.storage.planes, parity: parity,
                                                           fieldParity: fieldParity, intra: intra)
-                try #require(kernels.deinterlace(field, layout: layout, width: c.width, height: c.height, into: out))
+                try #require(gpu.run { kernels.encodeBwdif(field, layout: layout, width: c.width, height: c.height, into: out,
+                                                           pass: $0) })
                 return Picture(pts: pts, samples: Pictures.samples(out, layout, width: c.width, height: c.height))
             }
         }

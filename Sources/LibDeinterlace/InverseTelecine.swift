@@ -10,14 +10,15 @@ import AetherLibavutil
 
 /// Hard telecine and progressive-segmented film back to their film frames (docs/software-route-gpu.md 6.2, 6.3), as
 /// FFmpeg's documented recipe does it: `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate`, every option at its
-/// default. ``FieldMatcher`` and ``Decimator`` transcribe the C's decisions (vf_fieldmatch.c `filter_frame`,
-/// `compare_fields`, `checkmm`; vf_decimate.c `filter_frame`, `calc_diffs`), the per-pixel sums run on the GPU
-/// (``DeinterlaceKernels``), and a picture the matcher cannot make progressive goes through ``BwdifWindow`` at frame
-/// rate. Pictures are held, never copied: a decoded picture by its frame reference, a weave or a deinterlaced picture in
-/// a slab of its own.
+/// default. Every decision runs on the GPU in the caller's pass, with the per-pixel work it decides on, so the chain
+/// never waits for the GPU: fieldmatch's (vf_fieldmatch.c `filter_frame`, `compare_fields`, `checkmm`), bwdif's window
+/// at frame rate (yadif_common.c), and decimate's (vf_decimate.c `filter_frame`, `calc_diffs`), each picture's verdict in
+/// a record and the chain's running state in a buffer of its own. What the CPU keeps is what does not depend on the
+/// pictures: the three sliding windows, the counts, the timestamps the C carries forward. A picture's fate (kept, and
+/// at what timestamp, or dropped) is read once its pass has completed (``resolve(_:)``).
 ///
 /// Scope is fieldmatch's: 8-bit planar 4:4:4, 4:2:2, 4:2:0, 4:1:1 and 4:1:0 (``takes(format:width:height:)``).
-/// Not thread-safe; the owning decoder serialises access with its lock.
+/// Not thread-safe: one caller pushes; ``resolve(_:)`` may be called from a completion.
 public final class InverseTelecine {
 
     /// The formats vf_fieldmatch.c takes without a clean source.
@@ -35,394 +36,369 @@ public final class InverseTelecine {
     /// Makes an empty picture of the stream's format and size (a slab of the caller's), with what returns it.
     public typealias PictureMaker = (AVPixelFormat, Int, Int) -> (planes: PlaneSet, release: () -> Void)?
 
+    /// A film picture the chain puts out: written by the work of the pass it came from. Whether it goes out, and at what
+    /// timestamp, is ``resolve(_:)``'s once that work has completed.
+    public struct Output {
+        public let picture: BwdifWindow.Picture
+        let fixedPTS: Int64?
+        let result: Int?
+    }
+
+    /// What one ``push(_:into:)`` encoded: the pictures it puts out, and every picture its work reads or writes, which
+    /// the caller holds until the pass has completed.
+    public struct Pushed {
+        public var outputs: [Output] = []
+        public var touched: [BwdifWindow.Picture] = []
+    }
+
+    /// How many passes may be in flight at once: each takes the next of this many sets of working buffers.
+    public static let passesInFlight = 8
+
     let kernels: DeinterlaceKernels
     let makeBuffer: PictureMaker
     let layout: PictureLayout
     let format: AVPixelFormat
     let width: Int
     let height: Int
-
-    private let matcher: FieldMatcher
-    private let window: BwdifWindow
-    public private(set) var decimator: Decimator?
+    private let decimates: Bool
 
     /// The time base of every output timestamp: decimate's (the input frame period times 5/4), or bwdif's (half the
     /// input's) without decimation.
-    public var outputTimeBase: AVRational { decimator?.outputTimeBase ?? window.outputTimeBase }
+    public let outputTimeBase: AVRational
+    /// bwdif's output base and the factor that takes an input timestamp onto it.
+    private let windowTimeBase: AVRational
+    private let windowMultiplier: Int64
+
+    // The GPU's side: the chain's running state, a record per matched picture (a ring), decimate's results (a ring of
+    // cycles), and the working buffers of each pass in flight.
+    private let state: MTLBuffer
+    private let records: MTLBuffer
+    private let results: MTLBuffer
+    private static let recordRing = 64
+    private static let resultRing = 64 * Decimator.cycle
+    private var nextRecord = 0
+    private var nextResult = 0
+    private struct Scratch {
+        let map: MTLBuffer
+        let partials: MTLBuffer
+        let stats: MTLBuffer
+        let blocks: MTLBuffer
+    }
+    private let scratch: [Scratch]
+    private var nextScratch = 0
+    private let partialCount: Int
+    private let cells: (x: Int, y: Int)
+    private var resetPending = true
+
+    // fieldmatch's sliding window (vf_fieldmatch.c at its defaults: order=auto, mode=pc_n, field=auto, mchroma=1, no
+    // exclusion band, scthresh=12, combmatch=sc, cthresh=9, chroma=0, blockx=blocky=16, combpel=80).
+    public static let combpel = 80
+    public static let cthresh = 9
+    private let scthresh: Int64
+    private var prv: BwdifWindow.Picture?
+    private var src: BwdifWindow.Picture?
+    private var nxt: BwdifWindow.Picture?
+    /// The output link's frame_count_in: pictures put out so far.
+    private var emitted: Int64 = 0
+
+    /// A matched picture and its record.
+    private struct Matched {
+        let picture: BwdifWindow.Picture
+        let record: UInt32
+        /// The source's field order: the weave's, when it is still combed.
+        let field: Int
+    }
+    // bwdif's window at frame rate (yadif_common.c, deint=interlaced): the first picture stands in for its own
+    // predecessor, the last for its own successor.
+    private var windowPrev: Matched?
+    private var windowCur: Matched?
+    private var windowNext: Matched?
+    private var windowStartPending = false
+    private var windowDone = false
+
+    // decimate (vf_decimate.c at its defaults: cycle=5, dupthresh=1.1, scthresh=15, blockx=blocky=32, chroma=1, mixed=0).
+    private enum Decimator {
+        static let cycle = 5
+        static let blockx = 32
+        static let blocky = 32
+    }
+    private let dupthresh: Int64
+    private let decimateSCThresh: Int64
+    private let nxblocks: Int
+    private let nyblocks: Int
+    private var queue: [(picture: BwdifWindow.Picture, pts: Int64)] = []
+    private var last: BwdifWindow.Picture?
 
     /// `timeBase` is the decoded pictures'; `frameRate` the carriage rate (decimate needs a constant one). Without
     /// `decimates` (2:2, progressive-segmented film) every matched picture goes out.
     public init?(kernels: DeinterlaceKernels, makePicture: @escaping PictureMaker, format: AVPixelFormat, width: Int,
                  height: Int, timeBase: AVRational, frameRate: AVRational, decimates: Bool = true) {
         guard Self.takes(format: format, width: width, height: height), frameRate.num > 0, frameRate.den > 0,
-              let layout = PictureLayout(format: format) else { return nil }
+              let layout = PictureLayout(format: format),
+              let sizes = kernels.fieldMatchSizes(layout: layout, width: width, height: height, hsub: Int(layout.log2ChromaW))
+        else { return nil }
         self.kernels = kernels
         self.makeBuffer = makePicture
         self.layout = layout
         self.format = format
         self.width = width
         self.height = height
-        window = BwdifWindow(timeBase: timeBase, fieldRate: false)
-        matcher = FieldMatcher(kernels: kernels, layout: layout, width: width, height: height)
-        decimator = decimates ? Decimator(kernels: kernels, layout: layout, width: width, height: height,
-                                          inputTimeBase: window.outputTimeBase, frameRate: frameRate) : nil
-    }
-
-    /// Feeds a decoded picture (nil: end of stream) and returns the film pictures it releases, with their timestamps on
-    /// ``outputTimeBase``.
-    public func push(_ picture: BwdifWindow.Picture?) -> [(picture: BwdifWindow.Picture, pts: Int64)] {
-        var matched: [BwdifWindow.Picture] = []
-        if let picture {
-            if let m = matcher.push(picture, makeWeave: makePicture) { matched.append(m) }
-        } else {
-            if let m = matcher.push(nil, makeWeave: makePicture) { matched.append(m) }
+        self.decimates = decimates
+        (windowTimeBase, windowMultiplier) = BwdifWindow.outputTimeBase(for: timeBase)
+        // nondec_tb = 1 / fps; dec_tb = nondec_tb * cycle / (cycle - 1)
+        outputTimeBase = decimates
+            ? av_mul_q(av_inv_q(frameRate), AVRational(num: Int32(Decimator.cycle), den: Int32(Decimator.cycle - 1)))
+            : windowTimeBase
+        // (int64_t)((w * h * 255.0 * fm->scthresh_flt) / 100.0)
+        scthresh = Int64((Double(width * height) * 255.0 * 12.0) / 100.0)
+        dupthresh = Int64((Double(255 * Int64(Decimator.blockx) * Int64(Decimator.blocky)) * 1.1) / 100)
+        decimateSCThresh = Int64((Double(255 * Int64(width) * Int64(height)) * 15.0) / 100)
+        nxblocks = (width + Decimator.blockx / 2 - 1) / (Decimator.blockx / 2)
+        nyblocks = (height + Decimator.blocky / 2 - 1) / (Decimator.blocky / 2)
+        cells = ((width + 7) / 8, (height + 7) / 8)
+        partialCount = sizes.partials
+        let device = kernels.device
+        guard let state = device.makeBuffer(length: 8 * State.words, options: .storageModeShared),
+              let records = device.makeBuffer(length: 16 * Self.recordRing, options: .storageModeShared),
+              let results = device.makeBuffer(length: 16 * Self.resultRing, options: .storageModeShared) else { return nil }
+        memset(state.contents(), 0, state.length)
+        (self.state, self.records, self.results) = (state, records, results)
+        var sets: [Scratch] = []
+        for _ in 0..<Self.passesInFlight {
+            guard let map = device.makeBuffer(length: max(sizes.map, 16), options: .storageModePrivate),
+                  let partials = device.makeBuffer(length: 4 * max(sizes.partials, 4), options: .storageModePrivate),
+                  let stats = device.makeBuffer(length: 4 * 5 * cells.x * cells.y, options: .storageModePrivate),
+                  let blocks = device.makeBuffer(length: 4 * nxblocks * nyblocks, options: .storageModePrivate)
+            else { return nil }
+            sets.append(Scratch(map: map, partials: partials, stats: stats, blocks: blocks))
         }
-        var deinterlaced: [(BwdifWindow.Picture, Int64)] = []
-        for m in matched { deinterlaced += materialise(window.push(m)) }
-        if picture == nil { deinterlaced += materialise(window.finish()) }
-        guard let decimator else { return deinterlaced.map { (picture: $0.0, pts: $0.1) } }
-        var out: [(picture: BwdifWindow.Picture, pts: Int64)] = []
-        for (p, pts) in deinterlaced { out += decimator.push(p, pts: pts) }
-        if picture == nil { out += decimator.finish() }
-        return out
+        scratch = sets
     }
 
-    /// Drops everything held (a seek).
+    /// The state buffer's 64-bit words (the shader's IV_*).
+    private enum State {
+        static let words = 19
+        static let cycles = 7
+        static let cyclesWithDuplicate = 8
+    }
+
+    /// decimate's full cycles, and those with a picture under the duplicate threshold (the load probe's evidence of 3:2):
+    /// counted on the GPU, read once the passes pushed so far have completed.
+    public var cycles: Int { Int(state.contents().load(fromByteOffset: 8 * State.cycles, as: Int64.self)) }
+    public var cyclesWithDuplicate: Int {
+        Int(state.contents().load(fromByteOffset: 8 * State.cyclesWithDuplicate, as: Int64.self))
+    }
+
+    /// Whether `output` goes out, and at what timestamp on ``outputTimeBase`` (AV_NOPTS_VALUE when it has none): nil
+    /// when decimate dropped it. Valid once the pass that put it out has completed.
+    public func resolve(_ output: Output) -> Int64? {
+        if let fixed = output.fixedPTS { return fixed }
+        guard let index = output.result else { return nil }
+        let slot = results.contents().advanced(by: 16 * index)
+        guard slot.load(fromByteOffset: 8, as: Int64.self) != 0 else { return nil }
+        return slot.load(as: Int64.self)
+    }
+
+    /// Feeds a decoded picture (nil: end of stream), encoding its work into `pass`, and returns the film pictures it
+    /// releases. The pass's batch must start after the work of the passes pushed before it.
+    public func push(_ picture: BwdifWindow.Picture?, into pass: any DeinterlacePass) -> Pushed {
+        var pushed = Pushed()
+        let work = scratch[nextScratch]
+        nextScratch = (nextScratch + 1) % scratch.count
+        if let matched = match(picture, work: work, pass: pass, pushed: &pushed),
+           let out = window(matched, finishing: false, pass: pass, pushed: &pushed) {
+            decimate(out, work: work, pass: pass, pushed: &pushed)
+        }
+        // End of stream (ff_yadif_request_frame at EOF): the last picture, its own successor standing in for the next.
+        if picture == nil, !windowDone, let windowCur, let windowNext {
+            windowDone = true
+            let successor = windowNext.picture.clone(pts: Self.extrapolated(windowCur.picture.pts, windowNext.picture.pts))
+            if let out = window(Matched(picture: successor, record: windowNext.record, field: windowNext.field),
+                                finishing: true, pass: pass, pushed: &pushed) {
+                decimate(out, work: work, pass: pass, pushed: &pushed)
+            }
+        }
+        if picture == nil, decimates, !queue.isEmpty {
+            // decimate's end of stream: the partial cycle, nothing dropped.
+            pass.barrier()
+            endCycle(full: false, work: work, slot: 0, diffs: false, none: true, pass: pass, pushed: &pushed)
+        }
+        return pushed
+    }
+
+    /// Drops everything held (a seek): the chain starts over, its GPU state with the next picture's pass.
     public func reset() {
-        matcher.reset()
-        window.reset()
-        decimator?.reset()
+        prv = nil
+        src = nil
+        nxt = nil
+        emitted = 0
+        windowPrev = nil
+        windowCur = nil
+        windowNext = nil
+        windowStartPending = false
+        windowDone = false
+        queue.removeAll()
+        last = nil
+        resetPending = true
     }
 
-    /// An empty picture in a slab with `props`'s properties: the matcher's weaves and bwdif's outputs.
-    private func makePicture(props: UnsafePointer<AVFrame>, interlaced: Bool, topFieldFirst: Bool,
-                             pts: Int64) -> (BwdifWindow.Picture, PlaneSet)? {
+    private static let noPTS = Int64.min
+
+    private static func extrapolated(_ cur: Int64, _ next: Int64) -> Int64 {
+        next == noPTS || cur == noPTS ? noPTS : next * 2 - cur
+    }
+
+    /// An empty picture in a slab with `props`'s properties, flagged progressive: the weaves and bwdif's outputs.
+    private func makePicture(props: UnsafePointer<AVFrame>, pts: Int64) -> (BwdifWindow.Picture, PlaneSet)? {
         guard let made = makeBuffer(format, width, height), let frame = av_frame_alloc() else { return nil }
         _ = av_frame_copy_props(frame, props)
         frame.pointee.format = format.rawValue
         frame.pointee.width = Int32(width)
         frame.pointee.height = Int32(height)
         frame.pointee.pts = pts
-        Self.setFlags(frame, interlaced: interlaced, topFieldFirst: topFieldFirst)
+        frame.pointee.flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST)
         let storage = BwdifWindow.Storage(frame: frame, planes: made.planes, release: made.release)
         return (BwdifWindow.Picture(storage: storage, pts: pts), made.planes)
     }
 
-    static func setFlags(_ frame: UnsafeMutablePointer<AVFrame>, interlaced: Bool, topFieldFirst: Bool) {
-        frame.pointee.flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST)
-        if interlaced { frame.pointee.flags |= AV_FRAME_FLAG_INTERLACED }
-        if topFieldFirst { frame.pointee.flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST }
-    }
+    // MARK: fieldmatch
 
-    /// bwdif's outputs as held pictures: a passed-through picture as it is, a deinterlaced one written into a slab.
-    private func materialise(_ outputs: [BwdifWindow.Output]) -> [(BwdifWindow.Picture, Int64)] {
-        outputs.compactMap { output in
-            switch output {
-            case .picture(let p, let pts):
-                return (p, pts)
-            case .field(let prev, let cur, let next, let parity, let fieldParity, let intra, let pts):
-                guard let (picture, planes) = makePicture(props: cur.frame, interlaced: false, topFieldFirst: false, pts: pts)
-                else { return nil }
-                let field = DeinterlaceKernels.BwdifField(prev: prev.storage.planes, cur: cur.storage.planes,
-                                                           next: next.storage.planes, parity: parity, fieldParity: fieldParity,
-                                                           intra: intra)
-                guard kernels.deinterlace(field, layout: layout, width: width, height: height, into: planes) else { return nil }
-                return (picture, pts)
-            }
-        }
-    }
-}
-
-/// vf_fieldmatch.c at its defaults (`order=auto`, `mode=pc_n`, `field=auto`, `mchroma=1`, no exclusion band,
-/// `scthresh=12`, `combmatch=sc`, `cthresh=9`, `chroma=0`, `blockx=blocky=16`, `combpel=80`).
-public final class FieldMatcher {
-    enum Match: Int { case p = 0, c, n, b, u }
-
-    public static let combpel = 80
-    public static let cthresh = 9
-
-    let kernels: DeinterlaceKernels
-    let layout: PictureLayout
-    let width: Int
-    let height: Int
-    private let scthresh: Int64
-
-    private var prv: BwdifWindow.Picture?
-    private var src: BwdifWindow.Picture?
-    private var nxt: BwdifWindow.Picture?
-    private var lastscdiff: Int64 = 0
-    private var lastn: Int64 = 0
-    /// The output link's frame_count_in: pictures put out so far.
-    private var emitted: Int64 = 0
-
-    init(kernels: DeinterlaceKernels, layout: PictureLayout, width: Int, height: Int) {
-        self.kernels = kernels
-        self.layout = layout
-        self.width = width
-        self.height = height
-        // (int64_t)((w * h * 255.0 * fm->scthresh_flt) / 100.0)
-        scthresh = Int64((Double(width * height) * 255.0 * 12.0) / 100.0)
-    }
-
-    func reset() {
-        prv = nil
-        src = nil
-        nxt = nil
-        lastscdiff = 0
-        lastn = 0
-        emitted = 0
-    }
-
-    private static func fieldBase(_ match: Match, _ field: Int) -> Int { match.rawValue < 3 ? 2 - field : 1 + field }
-
-    private func select(_ match: Match) -> BwdifWindow.Picture {
-        switch match {
-        case .p, .b: return prv!
-        case .n, .u: return nxt!
-        case .c: return src!
-        }
-    }
-
-    /// The weave `match` makes (create_weave_frame): which picture gives the rows of which parity.
-    private func weaveParts(_ match: Match, field: Int) -> (other: BwdifWindow.Picture, srcParity: Int) {
-        switch match {
-        case .p: return (prv!, 1 - field)
-        case .n: return (nxt!, 1 - field)
-        case .b: return (prv!, field)
-        case .u: return (nxt!, field)
-        case .c: return (src!, 0)
-        }
-    }
-
-    /// filter_frame: `picture` nil flushes the last one.
-    func push(_ picture: BwdifWindow.Picture?,
-              makeWeave: (UnsafePointer<AVFrame>, Bool, Bool, Int64) -> (BwdifWindow.Picture, PlaneSet)?)
-        -> BwdifWindow.Picture? {
+    /// filter_frame: `picture` nil flushes the last one. The comparison, the luma statistics, the decision and the
+    /// weave, behind barriers where each reads the one before.
+    private func match(_ picture: BwdifWindow.Picture?, work: Scratch, pass: any DeinterlacePass,
+                       pushed: inout Pushed) -> Matched? {
         // SLIDING_FRAME_WINDOW
         prv = src
         src = nxt
         if let picture { nxt = picture }
         if prv == nil { prv = src }
-        guard prv != nil, let src, nxt != nil else { return nil }
-
+        guard let prv, let src, let nxt else { return nil }
         let order = src.interlaced ? (src.topFieldFirst ? 1 : 0) : 1
         let field = order
-        // field ^ order is 0 at the defaults: fxo0m, the matches in their own order.
-        var combs = [Int](repeating: -1, count: 5)
-
-        var match = compareFields(.c, .p, field: field)
-
-        var sc = false
-        if lastn == emitted - 1 {
-            if lastscdiff > scthresh { sc = true }
-        } else if let d = kernels.lumaAbsDiff(prv!.storage.planes, src.storage.planes, layout: layout, width: width, height: height),
-                  d > scthresh {
-            sc = true
-        }
-        if !sc {
-            lastn = emitted
-            lastscdiff = kernels.lumaAbsDiff(src.storage.planes, nxt!.storage.planes, layout: layout, width: width, height: height) ?? 0
-            sc = lastscdiff > scthresh
-        }
-        if sc { match = checkmm(&combs, match, .n, field: field) }
-
-        let interlacedFrame = combs[match.rawValue] >= Self.combpel
+        // field ^ order is 0 at the defaults: fxo0m, the matches in their own order. compare_fields(c, p): fbase of c and
+        // p is 2 - field; the map comes from the next field's rows when field is 1.
+        let fbase = 2 - field
+        let record = UInt32(nextRecord)
+        nextRecord = (nextRecord + 1) % Self.recordRing
+        guard let (out, planes) = makePicture(props: src.frame, pts: src.pts) else { return nil }
+        pushed.touched += [prv, src, nxt, out]
+        let windowArguments = windowPending(next: out)
+        guard kernels.encodeClear(work.map, words: (work.map.length + 3) / 4, layout: layout, pass: pass),
+              kernels.encodeLumaStatistics(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
+                                           pnParity: 1 - field, layout: layout, width: width, height: height,
+                                           cthresh: Self.cthresh, stats: work.stats, pass: pass) else { return nil }
+        pass.barrier()
+        guard kernels.encodeFieldMatchCompare(src: src.storage.planes, prev: src.storage.planes, next: prv.storage.planes,
+                                              layout: layout, width: width, height: height, fbase1: fbase, fbase2: fbase,
+                                              mapFromNextField: field == 1, hsub: Int(layout.log2ChromaW), map: work.map,
+                                              partials: work.partials, pass: pass) else { return nil }
+        pass.barrier()
+        guard kernels.encodeMatchDecide(partials: work.partials, partialCount: partialCount, stats: work.stats, cells: cells,
+                                        state: state, records: records, record: record, reset: resetPending,
+                                        window: windowArguments, emitted: emitted, scthresh: scthresh, layout: layout,
+                                        pass: pass) else { return nil }
+        resetPending = false
         emitted += 1
+        pass.barrier()
+        guard kernels.encodeWeave(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
+                                  srcParity: 1 - field, records: records, record: record, layout: layout, width: width,
+                                  height: height, into: planes, pass: pass) else { return nil }
+        pass.barrier()
+        return Matched(picture: out, record: record, field: field)
+    }
 
-        let out: BwdifWindow.Picture
-        if match == .c {
-            // av_frame_clone(src), flags set below: the decoded picture itself, with props of its own.
-            guard let frame = av_frame_alloc() else { return nil }
-            _ = av_frame_copy_props(frame, src.frame)
-            frame.pointee.format = src.frame.pointee.format
-            frame.pointee.width = src.frame.pointee.width
-            frame.pointee.height = src.frame.pointee.height
-            let held = src.storage
-            InverseTelecine.setFlags(frame, interlaced: interlacedFrame, topFieldFirst: interlacedFrame && field == 1)
-            out = BwdifWindow.Picture(storage: .init(frame: frame, planes: held.planes, release: { _ = held }), pts: src.pts)
+    // MARK: bwdif's window
+
+    /// The window's decision for the picture before `next`, which the match decision takes on (iv_match_decide), when
+    /// the window will have one to make once `next` is in.
+    private func windowPending(next: BwdifWindow.Picture) -> (prev: UInt32, cur: UInt32, prevRepeat: Bool, nextRepeat: Bool, start: Bool)? {
+        // The window after this push: prev = cur, cur = next (or, at the start, the first picture standing in for
+        // itself), next = this one.
+        let cur = windowNext ?? nil
+        guard let cur else { return nil }
+        let prev = windowCur ?? cur
+        return (prev.record, cur.record, prev.picture.repeatPict, next.repeatPict, windowStartPending || windowCur == nil)
+    }
+
+    /// ff_yadif_filter_frame at frame rate: the window slides and, once full, the current picture goes out, decided on
+    /// the GPU (passed through, or its first field deinterlaced). The decision was made with the match (or, at the end,
+    /// by iv_window_end); this encodes bwdif after it.
+    private func window(_ m: Matched, finishing: Bool, pass: any DeinterlacePass, pushed: inout Pushed) -> (BwdifWindow.Picture, Int64)? {
+        windowPrev = windowCur
+        windowCur = windowNext
+        windowNext = m
+        if windowCur == nil {
+            windowCur = m
+            windowStartPending = true
+            return nil
+        }
+        guard let prev = windowPrev ?? windowCur, let cur = windowCur, let next = windowNext else { return nil }
+        if finishing {
+            guard kernels.encodeWindowEnd(prev: prev.record, cur: cur.record, prevRepeat: prev.picture.repeatPict,
+                                          curRepeat: cur.picture.repeatPict, start: windowStartPending, state: state,
+                                          records: records, layout: layout, pass: pass) else { return nil }
+            pass.barrier()
+        }
+        windowStartPending = false
+        let pts = cur.picture.pts == Self.noPTS ? Self.noPTS : cur.picture.pts * windowMultiplier
+        guard let (out, planes) = makePicture(props: cur.picture.frame, pts: pts) else { return nil }
+        pushed.touched += [prev.picture, cur.picture, next.picture, out]
+        // A combed weave's field order is its source's; the field is the first (send_frame).
+        let tff = UInt32(cur.field == 1 ? 1 : 0)
+        let parity = tff ^ 1
+        let field = DeinterlaceKernels.BwdifField(prev: prev.picture.storage.planes, cur: cur.picture.storage.planes,
+                                                   next: next.picture.storage.planes, parity: parity, fieldParity: parity ^ tff,
+                                                   intra: false)
+        guard kernels.encodeBwdif(field, layout: layout, width: width, height: height, into: planes,
+                                  decided: (records, cur.record), pass: pass) else { return nil }
+        pass.barrier()
+        guard decimates else {
+            pushed.outputs.append(Output(picture: out, fixedPTS: pts, result: nil))
+            return nil
+        }
+        return (out, pts)
+    }
+
+    // MARK: decimate
+
+    /// filter_frame with a picture: its differences from the one before into the cycle's slot, and at the end of a cycle
+    /// the drop and the timestamps.
+    private func decimate(_ item: (BwdifWindow.Picture, Int64), work: Scratch, pass: any DeinterlacePass, pushed: inout Pushed) {
+        let (picture, pts) = item
+        let slot = queue.count
+        let prv = queue.last?.picture ?? last
+        queue.append((picture, pts))
+        if let prv {
+            pushed.touched.append(prv)
+            guard kernels.encodeBlockDiffs(prv.storage.planes, picture.storage.planes, layout: layout, width: width,
+                                           height: height, blockx: Decimator.blockx, blocky: Decimator.blocky,
+                                           blocksX: nxblocks, blocksY: nyblocks, into: work.blocks, pass: pass) else { return }
+            pass.barrier()
+        }
+        if queue.count == Decimator.cycle {
+            last = picture
+            endCycle(full: true, work: work, slot: slot, diffs: true, none: prv == nil, pass: pass, pushed: &pushed)
         } else {
-            let parts = weaveParts(match, field: field)
-            guard let (picture, planes) = makeWeave(src.frame, interlacedFrame, interlacedFrame && field == 1, src.pts),
-                  kernels.weave(src: src.storage.planes, other: parts.other.storage.planes, srcParity: parts.srcParity,
-                                 layout: layout, width: width, height: height, into: planes) else { return nil }
-            out = picture
+            _ = kernels.encodeDecimate(blocks: work.blocks, blocksX: nxblocks, blocksY: nyblocks, slot: slot, diffs: true,
+                                       none: prv == nil, cycle: nil, dupthresh: dupthresh, scthresh: decimateSCThresh,
+                                       state: state, results: results, layout: layout, pass: pass)
+            pass.barrier()
         }
-        return out
     }
 
-    /// checkmm.
-    private func checkmm(_ combs: inout [Int], _ m1: Match, _ m2: Match, field: Int) -> Match {
-        for m in [m1, m2] where combs[m.rawValue] < 0 {
-            let parts = weaveParts(m, field: field)
-            combs[m.rawValue] = kernels.combScore(src: src!.storage.planes, other: parts.other.storage.planes,
-                                                   srcParity: parts.srcParity, layout: layout, width: width, height: height,
-                                                   cthresh: Self.cthresh) ?? 0
+    /// The end of a cycle (or of the stream): the GPU decides, and every picture of the cycle goes out with a result slot.
+    private func endCycle(full: Bool, work: Scratch, slot: Int, diffs: Bool, none: Bool, pass: any DeinterlacePass,
+                          pushed: inout Pushed) {
+        let base = nextResult
+        nextResult = (nextResult + Decimator.cycle) % Self.resultRing
+        let rescaled: [Int64?] = queue.map { $0.pts == Self.noPTS ? nil : av_rescale_q($0.pts, windowTimeBase, outputTimeBase) }
+        _ = kernels.encodeDecimate(blocks: work.blocks, blocksX: nxblocks, blocksY: nyblocks, slot: slot, diffs: diffs,
+                                   none: none, cycle: (rescaled, full, base), dupthresh: dupthresh, scthresh: decimateSCThresh,
+                                   state: state, results: results, layout: layout, pass: pass)
+        pass.barrier()
+        for (i, item) in queue.enumerated() {
+            pushed.outputs.append(Output(picture: item.picture, fixedPTS: nil, result: base + i))
         }
-        let c1 = combs[m1.rawValue], c2 = combs[m2.rawValue]
-        if (c2 * 3 < c1 || (c2 * 2 < c1 && c1 > Self.combpel)) && abs(c2 - c1) >= 30 && c2 < Self.combpel {
-            return m2
-        }
-        return m1
-    }
-
-    /// compare_fields: the GPU's accumulations, then the C's ratios in single precision.
-    private func compareFields(_ match1: Match, _ match2: Match, field: Int) -> Match {
-        let fromNext = !((match1.rawValue >= 3 && field == 1) || (match1.rawValue < 3 && field != 1))
-        guard let a = kernels.fieldMatchCompare(src: src!.storage.planes, prev: select(match1).storage.planes,
-                                                 next: select(match2).storage.planes, layout: layout, width: width,
-                                                 height: height, fbase1: Self.fieldBase(match1, field),
-                                                 fbase2: Self.fieldBase(match2, field), mapFromNextField: fromNext,
-                                                 hsub: Int(layout.log2ChromaW)) else { return match1 }
-        return Self.decide(a, match1, match2)
-    }
-
-    /// compare_fields' decision, from its six accumulations.
-    static func decide(_ a: DeinterlaceKernels.FieldAccumulations, _ match1: Match, _ match2: Match) -> Match {
-        var accumPm = a.pm, accumNm = a.nm
-        if accumPm < 500 && accumNm < 500 && (a.pml >= 500 || a.nml >= 500) && max(a.pml, a.nml) > 3 * min(a.pml, a.nml) {
-            accumPm = a.pml
-            accumNm = a.nml
-        }
-        // (int)((accum / 6.0f) + 0.5f)
-        func norm(_ v: UInt64) -> Int { Int((Float(v) / Float(6.0)) + Float(0.5)) }
-        let norm1 = norm(a.pc), norm2 = norm(a.nc), mtn1 = norm(accumPm), mtn2 = norm(accumNm)
-        let c1 = Float(max(norm1, norm2)) / Float(max(min(norm1, norm2), 1))
-        let c2 = Float(max(mtn1, mtn2)) / Float(max(min(mtn1, mtn2), 1))
-        let mr = Float(max(mtn1, mtn2)) / Float(max(max(norm1, norm2), 1))
-        if ((mtn1 >= 500 || mtn2 >= 500) && (mtn1 * 2 < mtn2 * 1 || mtn2 * 2 < mtn1 * 1))
-            || ((mtn1 >= 1000 || mtn2 >= 1000) && (mtn1 * 3 < mtn2 * 2 || mtn2 * 3 < mtn1 * 2))
-            || ((mtn1 >= 2000 || mtn2 >= 2000) && (mtn1 * 5 < mtn2 * 4 || mtn2 * 5 < mtn1 * 4))
-            || ((mtn1 >= 4000 || mtn2 >= 4000) && c2 > c1) {
-            return mtn1 > mtn2 ? match2 : match1
-        } else if Double(mr) > 0.005 && max(mtn1, mtn2) > 150 && (mtn1 * 2 < mtn2 * 1 || mtn2 * 2 < mtn1 * 1) {
-            return mtn1 > mtn2 ? match2 : match1
-        }
-        return norm1 > norm2 ? match2 : match1
-    }
-}
-
-/// vf_decimate.c at its defaults (`cycle=5`, `dupthresh=1.1`, `scthresh=15`, `blockx=blocky=32`, `chroma=1`,
-/// `mixed=0`), 8-bit.
-public final class Decimator {
-    static let cycle = 5
-    static let blockx = 32
-    static let blocky = 32
-
-    let kernels: DeinterlaceKernels
-    let layout: PictureLayout
-    let width: Int
-    let height: Int
-    let inputTimeBase: AVRational
-    /// dec_tb: the input frame period times cycle / (cycle - 1).
-    let outputTimeBase: AVRational
-
-    private struct Item {
-        var picture: BwdifWindow.Picture
-        var pts: Int64
-        var maxbdiff: Int64
-        var totdiff: Int64
-    }
-
-    /// Full cycles seen, and those with a picture under the duplicate threshold (the load probe's evidence of 3:2).
-    public private(set) var cycles = 0
-    public private(set) var cyclesWithDuplicate = 0
-
-    private let dupthresh: Int64
-    private let scthresh: Int64
-    private let nxblocks: Int
-    private let nyblocks: Int
-    private var queue: [Item?]
-    private var fid = 0
-    private var last: BwdifWindow.Picture?
-    private var startPTS: Int64?
-    private var lastPTS: Int64 = 0
-    private var lastDuration: Int64 = 0
-
-    init(kernels: DeinterlaceKernels, layout: PictureLayout, width: Int, height: Int,
-         inputTimeBase: AVRational, frameRate: AVRational) {
-        self.kernels = kernels
-        self.layout = layout
-        self.width = width
-        self.height = height
-        self.inputTimeBase = inputTimeBase
-        // nondec_tb = 1 / fps; dec_tb = nondec_tb * cycle / (cycle - 1)
-        outputTimeBase = av_mul_q(av_inv_q(frameRate), AVRational(num: Int32(Self.cycle), den: Int32(Self.cycle - 1)))
-        let maxValue: Int64 = 255
-        dupthresh = Int64((Double(maxValue * Int64(Self.blockx) * Int64(Self.blocky)) * 1.1) / 100)
-        scthresh = Int64((Double(maxValue * Int64(width) * Int64(height)) * 15.0) / 100)
-        nxblocks = (width + Self.blockx / 2 - 1) / (Self.blockx / 2)
-        nyblocks = (height + Self.blocky / 2 - 1) / (Self.blocky / 2)
-        queue = Array(repeating: nil, count: Self.cycle)
-    }
-
-    func reset() {
-        queue = Array(repeating: nil, count: Self.cycle)
-        fid = 0
-        last = nil
-        startPTS = nil
-        lastPTS = 0
-        lastDuration = 0
-    }
-
-    /// filter_frame with a picture.
-    func push(_ picture: BwdifWindow.Picture, pts: Int64) -> [(picture: BwdifWindow.Picture, pts: Int64)] {
-        let prv = fid > 0 ? queue[fid - 1]?.picture : last
-        var item = Item(picture: picture, pts: pts, maxbdiff: Int64.max, totdiff: Int64.max)
-        if let prv { (item.maxbdiff, item.totdiff) = calcDiffs(prv, picture) }
-        queue[fid] = item
-        fid += 1
-        guard fid == Self.cycle else { return [] }
-        last = picture
-        fid = 0
-        var scpos = -1, duppos = -1, lowest = 0
-        for i in 0..<Self.cycle {
-            if queue[i]!.totdiff > scthresh { scpos = i }
-            if queue[i]!.maxbdiff < queue[lowest]!.maxbdiff { lowest = i }
-        }
-        if queue[lowest]!.maxbdiff < dupthresh { duppos = lowest }
-        cycles += 1
-        if duppos >= 0 { cyclesWithDuplicate += 1 }
-        let drop = scpos >= 0 && duppos < 0 ? scpos : lowest
-        return emit(drop: drop)
-    }
-
-    /// filter_frame at end of stream: the partial cycle, nothing dropped.
-    func finish() -> [(picture: BwdifWindow.Picture, pts: Int64)] {
-        let out = emit(drop: Int.min)
-        fid = 0
-        return out
-    }
-
-    private func emit(drop: Int) -> [(picture: BwdifWindow.Picture, pts: Int64)] {
-        var out: [(picture: BwdifWindow.Picture, pts: Int64)] = []
-        for i in 0..<Self.cycle {
-            guard let item = queue[i] else { break }
-            queue[i] = nil
-            if i == drop { continue }
-            if item.pts != Int64.min, startPTS == nil {
-                startPTS = av_rescale_q(item.pts, inputTimeBase, outputTimeBase)
-            }
-            let pts = lastDuration != 0 ? lastPTS + lastDuration : (startPTS ?? 0)
-            lastDuration = 1
-            lastPTS = pts
-            out.append((item.picture, pts))
-        }
-        return out
-    }
-
-    /// calc_diffs: the largest sum over 2 x 2 neighbouring blocks, and the total.
-    private func calcDiffs(_ a: BwdifWindow.Picture, _ b: BwdifWindow.Picture) -> (Int64, Int64) {
-        guard let bdiffs = kernels.blockDiffs(a.storage.planes, b.storage.planes, layout: layout, width: width, height: height,
-                                               blockx: Self.blockx, blocky: Self.blocky, blocksX: nxblocks, blocksY: nyblocks)
-        else { return (Int64.max, Int64.max) }
-        var maxdiff: Int64 = -1
-        for i in 0..<max(nyblocks - 1, 0) {
-            for j in 0..<max(nxblocks - 1, 0) {
-                let tmp = bdiffs[i * nxblocks + j] + bdiffs[i * nxblocks + j + 1]
-                    + bdiffs[(i + 1) * nxblocks + j] + bdiffs[(i + 1) * nxblocks + j + 1]
-                if tmp > maxdiff { maxdiff = tmp }
-            }
-        }
-        return (maxdiff, bdiffs.reduce(0, +))
+        queue.removeAll()
     }
 }

@@ -195,13 +195,25 @@ struct InverseTelecineReferenceTests {
 
     private static func gpu(_ frames: [[[UInt8]]], _ c: Case, _ layout: PictureLayout) throws -> [Output] {
         let device = try #require(Pictures.device, "needs a Metal device")
-        let kernels = DeinterlaceKernels(submission: try #require(Metal3Submission(device: device)))
+        let gpu = try #require(Metal3Submission(device: device))
+        let kernels = DeinterlaceKernels(submission: gpu)
         let chain = try #require(InverseTelecine(
             kernels: kernels,
             makePicture: { _, w, h in Pictures.planar(layout, width: w, height: h).map { ($0, {}) } },
             format: c.format, width: c.width, height: c.height, timeBase: timeBase, frameRate: carriage,
             decimates: !c.psf))
-        var out: [(picture: BwdifWindow.Picture, pts: Int64)] = []
+        // A batch a picture, none waited for until the end, as a player submits them; the pictures each pass touched held
+        // until then.
+        var outputs: [InverseTelecine.Output] = []
+        var held: [BwdifWindow.Picture] = []
+        func push(_ picture: BwdifWindow.Picture?) {
+            gpu.run(wait: false) { pass in
+                let pushed = chain.push(picture, into: pass)
+                outputs += pushed.outputs
+                held += pushed.touched
+                return true
+            }
+        }
         for (n, planes) in frames.enumerated() {
             let set = try #require(Pictures.planar(layout, width: c.width, height: c.height))
             let base = set.buffer.contents().assumingMemoryBound(to: UInt8.self)
@@ -218,13 +230,17 @@ struct InverseTelecineReferenceTests {
             frame.pointee.pts = Int64(n)
             frame.pointee.flags |= AV_FRAME_FLAG_INTERLACED
             if c.topFieldFirst { frame.pointee.flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST }
-            out += chain.push(BwdifWindow.Picture(storage: .init(frame: frame, planes: set, release: nil), pts: Int64(n)))
+            push(BwdifWindow.Picture(storage: .init(frame: frame, planes: set, release: nil), pts: Int64(n)))
         }
-        out += chain.push(nil)
+        push(nil)
+        gpu.run { _ in true }
+        withExtendedLifetime(held) {}
         let tb = chain.outputTimeBase
-        return out.map {
-            Output(time: ($0.pts * Int64(tb.num), Int64(tb.den)),
-                   samples: Pictures.samples($0.picture.storage.planes, layout, width: c.width, height: c.height))
+        return outputs.compactMap { output in
+            chain.resolve(output).map { pts in
+                Output(time: (pts * Int64(tb.num), Int64(tb.den)),
+                       samples: Pictures.samples(output.picture.storage.planes, layout, width: c.width, height: c.height))
+            }
         }
     }
 }

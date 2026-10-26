@@ -9,6 +9,8 @@ import Metal
 /// (``DeinterlaceKernels/encodeBwdif(_:layout:width:height:into:pass:)``).
 public protocol DeinterlaceSubmission: AnyObject, Sendable {
     var device: MTLDevice { get }
+    /// A new batch, which starts on the GPU only after the work committed before it from this submission: inverse
+    /// telecine's passes carry their running state from one to the next.
     func makeBatch() -> (any DeinterlaceBatch)?
 }
 
@@ -29,6 +31,7 @@ public protocol DeinterlacePass: AnyObject {
     /// `bytes` copied into the batch and bound at `index`, as a small constant argument.
     func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int)
     func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize)
+    func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize)
     /// Every dispatch after this sees every write before it.
     func barrier()
 }

@@ -17,7 +17,7 @@ every plane) to equal FFmpeg's on the same frames.
 | `BwdifWindow` | `libavfilter/yadif_common.c` | which pictures, parities and timestamps each field takes (`deint=interlaced`, `parity=auto`, field or frame rate) |
 | `FieldMatcher` | `libavfilter/vf_fieldmatch.c` | the film frame each interlaced frame weaves into (defaults: `mode=pc_n`, `combmatch=sc`) |
 | `Decimator` | `libavfilter/vf_decimate.c` | one picture of five dropped, timestamps on the film rate (defaults: `cycle=5`) |
-| `InverseTelecine` | FFmpeg's documented recipe `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate` | film frames back out of 3:2 or 2:2 carriage |
+| `InverseTelecine` | FFmpeg's documented recipe `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate` | film frames back out of 3:2 or 2:2 carriage, every decision taken on the GPU in the caller's pass |
 
 Pictures cross the interface as `PlaneSet` (a Metal buffer, plane offsets and linesizes) described by a `PictureLayout`
 (FFmpeg's component descriptors), so planar, semi-planar and packed layouts all read as their planar equivalent.
@@ -29,6 +29,14 @@ The library owns no command queue. Its GPU work goes through the caller's submis
 field can share one submission with the caller's own passes, and the calls that return results (the field matcher's and
 decimator's sums, a woven picture) commit a batch of their own and wait for it. The protocols are bindings by index,
 pipelines, small constant arguments, dispatches and barriers, so a caller can implement them over Metal 4 or Metal 3.
+
+Inverse telecine never waits for the GPU. fieldmatch's decisions (compare_fields, the scene-change test, checkmm),
+bwdif's window at frame rate and decimate's choice of the picture to drop run as kernels in the same pass as the
+per-pixel work they decide on, each picture's verdict in a record and the chain's running state (fieldmatch's
+scene-change memory, bwdif's field-end, decimate's timestamps and cycle) in a buffer of its own. `push(_:into:)`
+encodes one picture's work into the caller's pass and returns the film pictures it releases, and every picture the work
+reads, which the caller holds until the pass has completed; `resolve(_:)` then says whether each goes out, and at what
+timestamp. A pass's batch must start after the previous one's work.
 
 Scope is FFmpeg's: bwdif on the formats `vf_bwdif.c` takes (8 to 16 bits, 4:2:0, 4:2:2, 4:4:4, 4:1:1, 4:4:0, 4:1:0,
 grey 8 and 16; `BwdifWindow.referenceFormats`), field matching and decimation on 8-bit 4:4:4, 4:2:2, 4:2:0, 4:1:1 and

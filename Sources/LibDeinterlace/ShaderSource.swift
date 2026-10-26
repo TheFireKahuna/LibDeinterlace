@@ -71,6 +71,8 @@ struct PFBwdif {
     uint out_offset;     // the scratch plane
     uint out_linesize;
     uint out_wide;       // two bytes a sample
+    uint decided;        // inverse telecine: whether to deinterlace, and intra, come from `record` (iv_window_decide)
+    uint record;
 };
 
 // bwdifdsp.c's coefficients, over 2^13.
@@ -89,7 +91,7 @@ static inline int pf_bw_read(device const uchar* s, constant PFPicture& p, uint 
 // One interpolated sample at (x, y). The reference offsets are vf_bwdif.c's: mirrored at the picture's top and
 // bottom for intra and edge rows, plain +-1 ... +-4 rows elsewhere.
 static inline int pf_bw_sample(device const uchar* prev, device const uchar* cur, device const uchar* next,
-                               constant PFBwdif& b, uint x, int y) {
+                               constant PFBwdif& b, uint intra, uint x, int y) {
     int h = int(b.height);
     uint c = b.component;
     int clip_max = int(b.clip_max);
@@ -98,7 +100,7 @@ static inline int pf_bw_sample(device const uchar* prev, device const uchar* cur
     #define NEXT(r) pf_bw_read(next, b.next, c, x, y + (r))
     #define P2(r)   (b.field_parity ? PREV(r) : CUR(r))
     #define N2(r)   (b.field_parity ? CUR(r) : NEXT(r))
-    if (b.intra != 0u) {
+    if (intra != 0u) {
         int prefs = y + 1 < h ? 1 : -1, mrefs = y > 0 ? -1 : 1;
         int prefs3 = y + 3 < h ? 3 : -1, mrefs3 = y > 2 ? -3 : 1;
         int interpol = (PF_BW_SP0 * (CUR(mrefs) + CUR(prefs)) - PF_BW_SP1 * (CUR(mrefs3) + CUR(prefs3))) >> 13;
@@ -165,24 +167,49 @@ static inline void pf_bw_write(device uchar* out, constant PFBwdif& b, uint x, u
 
 // One thread per four columns of a row pair: the current field's row, copied, and the row between, interpolated.
 // Four adjacent samples share every row of their window, so its loads come from the same cache lines.
-kernel void pf_bwdif(device const uchar*  prev  [[buffer(0)]],
-                     constant PFBwdif&    b     [[buffer(1)]],
-                     device const uchar*  cur   [[buffer(5)]],
-                     device const uchar*  next  [[buffer(6)]],
-                     device uchar*        out   [[buffer(7)]],
-                     uint2                gid   [[thread_position_in_grid]]) {
+// Inverse telecine's per-picture decisions, one record per matched picture in a ring the caller indexes: the match
+// fieldmatch chose (iv_match_decide), whether the weave is still combed, and what bwdif's window made of it
+// (iv_window_decide).
+struct IVRecord {
+    uint match;          // 0 p, 1 c, 2 n
+    uint combed;         // fieldmatch's combed verdict: the weave goes out flagged interlaced
+    uint passthrough;    // bwdif left the picture as it is
+    uint intra;          // bwdif's first field after the start: FILTER_INTRA
+};
+
+// One thread per four columns of a row pair: the current field's row, copied, and the row between, interpolated.
+// Four adjacent samples share every row of their window, so its loads come from the same cache lines. A decided
+// dispatch (inverse telecine) copies the current picture where the window decision left it as it is.
+//
+// Every component in one dispatch, the component the grid's third axis.
+struct PFBwdifs {
+    PFBwdif component[3];
+};
+
+kernel void pf_bwdif(device const uchar*     prev    [[buffer(0)]],
+                     constant PFBwdifs&      bs      [[buffer(1)]],
+                     device const IVRecord*  records [[buffer(2)]],
+                     device const uchar*     cur     [[buffer(5)]],
+                     device const uchar*     next    [[buffer(6)]],
+                     device uchar*           out     [[buffer(7)]],
+                     uint3                   gid     [[thread_position_in_grid]]) {
+    constant PFBwdif& b = bs.component[gid.z];
     uint x0 = gid.x * 4u;
     if (x0 >= b.width) { return; }
     uint kept = 2u * gid.y + b.parity;
     uint interpolated = 2u * gid.y + (b.parity ^ 1u);
     uint n = min(4u, b.width - x0);
+    bool copy = b.decided != 0u && records[b.record].passthrough != 0u;
+    uint intra = b.decided != 0u ? records[b.record].intra : b.intra;
     for (uint i = 0u; i < n; ++i) {
         uint x = x0 + i;
         if (kept < b.height) {
             pf_bw_write(out, b, x, kept, pf_bw_read(cur, b.cur, b.component, x, int(kept)));
         }
         if (interpolated < b.height) {
-            pf_bw_write(out, b, x, interpolated, pf_bw_sample(prev, cur, next, b, x, int(interpolated)));
+            int v = copy ? pf_bw_read(cur, b.cur, b.component, x, int(interpolated))
+                         : pf_bw_sample(prev, cur, next, b, intra, x, int(interpolated));
+            pf_bw_write(out, b, x, interpolated, v);
         }
     }
 }
@@ -211,17 +238,23 @@ struct FMDiffMap {
     uint map_offset;     // the plane's map (one byte a sample, width-wide rows)
 };
 
+// Every plane's in one dispatch, the plane the grid's third axis.
+struct FMDiffMaps {
+    FMDiffMap plane[3];
+};
+
 static inline int fm_dp(device const uchar* prv, device const uchar* nxt, constant FMDiffMap& m, int k, int u) {
     return abs(fm_read(prv, m.prv, m.plane.component, u, int(m.base) - 2 + 2 * k)
                - fm_read(nxt, m.nxt, m.plane.component, u, int(m.base2) - 2 + 2 * k));
 }
 
 // One thread per map sample of the rows y = 2, 4, ... < height - 2 (i = (y - 2) / 2), x = 1 ... width - 2.
-kernel void fm_diffmap(device const uchar*  prv  [[buffer(0)]],
-                       constant FMDiffMap&  m    [[buffer(1)]],
-                       device const uchar*  nxt  [[buffer(5)]],
-                       device uchar*        map  [[buffer(7)]],
-                       uint2                gid  [[thread_position_in_grid]]) {
+kernel void fm_diffmap(device const uchar*   prv  [[buffer(0)]],
+                       constant FMDiffMaps&  maps [[buffer(1)]],
+                       device const uchar*   nxt  [[buffer(5)]],
+                       device uchar*         map  [[buffer(7)]],
+                       uint3                 gid  [[thread_position_in_grid]]) {
+    constant FMDiffMap& m = maps.plane[gid.z];
     int width = int(m.plane.width), height = int(m.plane.height);
     int x = int(gid.x) + 1;
     int i = int(gid.y);
@@ -282,20 +315,26 @@ struct FMCompare {
     uint fbase2;         // get_field_base(match2, field)
     uint startx;
     uint map_offset;
-    uint partial_offset; // this dispatch's slots in the partials buffer, six a threadgroup
+    uint partial_offset; // this plane's slots in the partials buffer, six a threadgroup of the grid
 };
 
-// One thread per sample of rows y = 2, 4, ... < height - 2 (k = (y - 2) / 2), x = startx ... width - startx - 1.
-kernel void fm_accumulate(device const uchar*  srcb    [[buffer(0)]],
-                          constant FMCompare&  c       [[buffer(1)]],
-                          device const uchar*  prevb   [[buffer(5)]],
-                          device const uchar*  nextb   [[buffer(6)]],
-                          device const uchar*  map     [[buffer(7)]],
-                          device uint*         partial [[buffer(8)]],
-                          uint2                gid     [[thread_position_in_grid]],
-                          uint2                tgid    [[threadgroup_position_in_grid]],
-                          uint2                tgcount [[threadgroups_per_grid]],
-                          uint                 tindex  [[thread_index_in_threadgroup]]) {
+struct FMCompares {
+    FMCompare plane[3];
+};
+
+// One thread per sample of rows y = 2, 4, ... < height - 2 (k = (y - 2) / 2), x = startx ... width - startx - 1, every
+// plane in one dispatch. Every threadgroup writes its six sums, zero where it covers nothing.
+kernel void fm_accumulate(device const uchar*   srcb    [[buffer(0)]],
+                          constant FMCompares&  cs      [[buffer(1)]],
+                          device const uchar*   prevb   [[buffer(5)]],
+                          device const uchar*   nextb   [[buffer(6)]],
+                          device const uchar*   map     [[buffer(7)]],
+                          device uint*          partial [[buffer(8)]],
+                          uint3                 gid     [[thread_position_in_grid]],
+                          uint3                 tgid    [[threadgroup_position_in_grid]],
+                          uint3                 tgcount [[threadgroups_per_grid]],
+                          uint                  tindex  [[thread_index_in_threadgroup]]) {
+    constant FMCompare& c = cs.plane[gid.z];
     threadgroup atomic_uint sums[6];
     if (tindex < 6u) { atomic_store_explicit(&sums[tindex], 0u, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -335,25 +374,17 @@ kernel void fm_accumulate(device const uchar*  srcb    [[buffer(0)]],
     }
 }
 
-// calc_combed_score on a weave of two pictures (luma, the default chroma=0): the comb mask, then pixels combed on three
-// consecutive rows, counted per 8 x 8 cell (half the default 16 x 16 block); the CPU takes the largest 2 x 2 window.
-struct FMComb {
-    PFPicture src;
-    PFPicture other;
-    FMPlane plane;
-    uint src_parity;     // rows of this parity come from src, the others from `other`
-    int cthresh;
-    uint cells_x;        // cells a row
-};
-
-static inline int fm_weave(device const uchar* srcb, device const uchar* otherb, constant FMComb& b, int x, int y) {
-    return (uint(y) & 1u) == b.src_parity ? fm_read(srcb, b.src, 0u, x, y) : fm_read(otherb, b.other, 0u, x, y);
+// calc_combed_score's comb mask (luma, the default chroma=0) on the weave whose rows of `parity` come from `src` and
+// the others from `other`. Kept inline: outlined, the compiler makes these calls with a stack frame of their own.
+static inline __attribute__((always_inline)) int fm_weave(device const uchar* srcb, constant PFPicture& src, device const uchar* otherb,
+                           constant PFPicture& other, uint parity, int x, int y) {
+    return (uint(y) & 1u) == parity ? fm_read(srcb, src, 0u, x, y) : fm_read(otherb, other, 0u, x, y);
 }
 
-static inline bool fm_cmask(device const uchar* srcb, device const uchar* otherb, constant FMComb& b, int x, int y) {
-    int h = int(b.plane.height);
-    int ct = b.cthresh, ct6 = ct * 6;
-    #define W(r) fm_weave(srcb, otherb, b, x, (r))
+static inline __attribute__((always_inline)) bool fm_cmask(device const uchar* srcb, constant PFPicture& src, device const uchar* otherb,
+                            constant PFPicture& other, uint parity, int h, int ct, int x, int y) {
+    int ct6 = ct * 6;
+    #define W(r) fm_weave(srcb, src, otherb, other, parity, x, (r))
     #define FILTER(xm2, xm1, xp1, xp2) (abs(4 * W(y) - 3 * (W(y + (xm1)) + W(y + (xp1))) + (W(y + (xm2)) + W(y + (xp2)))) > ct6)
     bool on;
     if (y == 0) {
@@ -372,78 +403,413 @@ static inline bool fm_cmask(device const uchar* srcb, device const uchar* otherb
     return on;
 }
 
-// One thread per pixel of rows 1 ... height - 2.
+// A pixel of rows 1 ... height - 2 is combed when the mask is on at it and the rows above and below.
+static inline __attribute__((always_inline)) bool fm_combed(device const uchar* srcb, constant PFPicture& src, device const uchar* otherb,
+                             constant PFPicture& other, uint parity, int w, int h, int ct, int x, int y) {
+    if (x >= w || y < 1 || y >= h - 1) { return false; }
+    return ct < 0 || (fm_cmask(srcb, src, otherb, other, parity, h, ct, x, y - 1)
+                      && fm_cmask(srcb, src, otherb, other, parity, h, ct, x, y)
+                      && fm_cmask(srcb, src, otherb, other, parity, h, ct, x, y + 1));
+}
+
+// calc_combed_score's per-cell counts for one weave (the load probe's question: is this picture combed): pixels
+// combed, per 8 x 8 cell (half the default 16 x 16 block); the caller takes the largest 2 x 2 window.
+struct FMComb {
+    PFPicture src;
+    PFPicture other;
+    FMPlane plane;
+    uint src_parity;     // rows of this parity come from src, the others from `other`
+    int cthresh;
+    uint cells_x;        // cells a row
+};
+
 kernel void fm_comb(device const uchar*  srcb   [[buffer(0)]],
                     constant FMComb&     b      [[buffer(1)]],
                     device const uchar*  otherb [[buffer(5)]],
                     device atomic_uint*  cells  [[buffer(8)]],
                     uint2                gid    [[thread_position_in_grid]]) {
-    int x = int(gid.x), y = int(gid.y) + 1;
-    if (x >= int(b.plane.width) || y >= int(b.plane.height) - 1) { return; }
-    if (b.cthresh >= 0 && !(fm_cmask(srcb, otherb, b, x, y - 1) && fm_cmask(srcb, otherb, b, x, y)
-                            && fm_cmask(srcb, otherb, b, x, y + 1))) { return; }
+    int x = int(gid.x), y = int(gid.y);
+    if (!fm_combed(srcb, b.src, otherb, b.other, b.src_parity, int(b.plane.width), int(b.plane.height), b.cthresh, x, y)) {
+        return;
+    }
     atomic_fetch_add_explicit(&cells[uint(y >> 3) * b.cells_x + uint(x >> 3)], 1u, memory_order_relaxed);
 }
 
-// luma_abs_diff, and calc_diffs' block sums: |a - b| summed per block of `block_w` x `block_h` samples of one plane
-// (block_w 0: the whole plane in per-threadgroup partials).
-struct FMDiff {
-    PFPicture a;
-    PFPicture b;
-    FMPlane plane;
-    uint block_w;
-    uint block_h;
-    uint blocks_x;       // blocks a row of the luma grid
+// The zero-filled buffers a picture's dispatches write into: the diff map's rows the C never writes are read as 0.
+kernel void iv_clear(constant uint&  count [[buffer(1)]],
+                     device uint*    words [[buffer(8)]],
+                     uint            gid   [[thread_position_in_grid]]) {
+    if (gid < count) { words[gid] = 0u; }
+}
+
+// MARK: - Inverse telecine's decisions on the GPU
+
+// The chain's state, carried from picture to picture in one buffer of 64-bit words (InverseTelecine.State).
+constant uint IV_LASTSCDIFF = 0, IV_LASTN = 1, IV_FIELD_END = 2, IV_START_SET = 3, IV_START_PTS = 4, IV_LAST_PTS = 5,
+              IV_LAST_DURATION = 6, IV_CYCLES = 7, IV_CYCLES_WITH_DUPLICATE = 8, IV_MAXBDIFF = 9, IV_TOTDIFF = 14;
+constant uint IV_THREADS = 256;
+
+// One picture's luma statistics for fieldmatch, every one from a single read of its rows: |prv - src| and
+// |src - nxt| summed per threadgroup (luma_abs_diff), and calc_combed_score's cell counts for the weaves p, c and n.
+// A threadgroup is one 8 x 8 cell, so each cell's counts are written once, whole.
+struct IVLuma {
+    PFPicture prv;
+    PFPicture src;
+    PFPicture nxt;
+    uint width;
+    uint height;
+    uint pn_parity;      // the weaves p and n take their rows of this parity from src (1 - field)
+    int cthresh;
+    uint cells_x;
+    uint cells_y;
 };
 
-kernel void fm_absdiff(device const uchar*  ab    [[buffer(0)]],
-                       constant FMDiff&     d     [[buffer(1)]],
-                       device const uchar*  bb    [[buffer(5)]],
-                       device atomic_uint*  out   [[buffer(8)]],
-                       uint2                gid   [[thread_position_in_grid]],
-                       uint2                tgid  [[threadgroup_position_in_grid]],
-                       uint2                tgcount [[threadgroups_per_grid]],
-                       uint                 tindex [[thread_index_in_threadgroup]]) {
-    threadgroup atomic_uint sum;
-    if (tindex == 0u) { atomic_store_explicit(&sum, 0u, memory_order_relaxed); }
+kernel void iv_luma(device const uchar*  prvb  [[buffer(0)]],
+                    constant IVLuma&     l     [[buffer(1)]],
+                    device const uchar*  srcb  [[buffer(5)]],
+                    device const uchar*  nxtb  [[buffer(6)]],
+                    device uint*         luma  [[buffer(7)]],
+                    device uint*         cells [[buffer(8)]],
+                    uint2                gid   [[thread_position_in_grid]],
+                    uint2                tgid  [[threadgroup_position_in_grid]],
+                    uint                 tindex [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint sums[5];
+    if (tindex < 5u) { atomic_store_explicit(&sums[tindex], 0u, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    int x = int(gid.x), y = int(gid.y);
-    uint v = 0u;
-    if (x < int(d.plane.width) && y < int(d.plane.height)) {
-        v = uint(abs(fm_read(ab, d.a, d.plane.component, x, y) - fm_read(bb, d.b, d.plane.component, x, y)));
-    }
-    if (d.block_w == 0u) {
-        if (v) { atomic_fetch_add_explicit(&sum, v, memory_order_relaxed); }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tindex == 0u) {
-            atomic_store_explicit(&out[tgid.y * tgcount.x + tgid.x], atomic_load_explicit(&sum, memory_order_relaxed),
-                                  memory_order_relaxed);
+    int x = int(gid.x), y = int(gid.y), w = int(l.width), h = int(l.height);
+    if (x < w && y < h) {
+        int s = fm_read(srcb, l.src, 0u, x, y);
+        uint dp = uint(abs(fm_read(prvb, l.prv, 0u, x, y) - s)), dn = uint(abs(s - fm_read(nxtb, l.nxt, 0u, x, y)));
+        if (dp) { atomic_fetch_add_explicit(&sums[0], dp, memory_order_relaxed); }
+        if (dn) { atomic_fetch_add_explicit(&sums[1], dn, memory_order_relaxed); }
+        // Weaves by match: p (rows not of pn_parity from prv), c (src alone), n (from nxt).
+        if (fm_combed(srcb, l.src, prvb, l.prv, l.pn_parity, w, h, l.cthresh, x, y)) {
+            atomic_fetch_add_explicit(&sums[2], 1u, memory_order_relaxed);
         }
-    } else if (v) {
-        atomic_fetch_add_explicit(&out[uint(y) / d.block_h * d.blocks_x + uint(x) / d.block_w], v, memory_order_relaxed);
+        if (fm_combed(srcb, l.src, srcb, l.src, 0u, w, h, l.cthresh, x, y)) {
+            atomic_fetch_add_explicit(&sums[3], 1u, memory_order_relaxed);
+        }
+        if (fm_combed(srcb, l.src, nxtb, l.nxt, l.pn_parity, w, h, l.cthresh, x, y)) {
+            atomic_fetch_add_explicit(&sums[4], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint cell = tgid.y * l.cells_x + tgid.x, cellCount = l.cells_x * l.cells_y;
+    if (tindex < 2u) {
+        luma[tindex * cellCount + cell] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
+    } else if (tindex < 5u) {
+        cells[(tindex - 2u) * cellCount + cell] = atomic_load_explicit(&sums[tindex], memory_order_relaxed);
     }
 }
 
-// create_weave_frame: rows of `src_parity` from src, the others from `other`, written planar at 8 bits.
-struct FMWeave {
-    PFPicture src;
-    PFPicture other;
+struct IVMatch {
+    uint partials;       // fm_accumulate's words: six a threadgroup, every plane
+    uint cells_x;        // iv_luma's cells: the two differences' partials, then a comb grid per weave p, c, n
+    uint cells_y;
+    uint record;
+    uint reset;          // the chain starts over (a seek): fieldmatch's scene-change state, bwdif's, decimate's
+    uint window;         // bwdif's window has a picture to decide: window_prev / window_cur, with this one as next
+    uint window_prev;
+    uint window_cur;
+    uint prev_repeat;
+    uint next_repeat;
+    uint window_start;   // the window's first output since the start: its first deinterlaced field is intra
+    uint pad;
+    long emitted;        // the pictures fieldmatch has put out before this one
+    long scthresh;
+};
+
+// vf_fieldmatch.c compare_fields' decision from its six accumulations, between match1 and match2.
+static inline uint iv_compare(thread const ulong* a, uint match1, uint match2) {
+    ulong accumPm = a[1], accumNm = a[4];
+    if (accumPm < 500 && accumNm < 500 && (a[2] >= 500 || a[5] >= 500) && max(a[2], a[5]) > 3 * min(a[2], a[5])) {
+        accumPm = a[2];
+        accumNm = a[5];
+    }
+    int norm1 = int((float(a[0]) / 6.0f) + 0.5f), norm2 = int((float(a[3]) / 6.0f) + 0.5f);
+    int mtn1 = int((float(accumPm) / 6.0f) + 0.5f), mtn2 = int((float(accumNm) / 6.0f) + 0.5f);
+    float c1 = float(max(norm1, norm2)) / float(max(min(norm1, norm2), 1));
+    float c2 = float(max(mtn1, mtn2)) / float(max(min(mtn1, mtn2), 1));
+    float mr = float(max(mtn1, mtn2)) / float(max(max(norm1, norm2), 1));
+    if (((mtn1 >= 500 || mtn2 >= 500) && (mtn1 * 2 < mtn2 * 1 || mtn2 * 2 < mtn1 * 1))
+        || ((mtn1 >= 1000 || mtn2 >= 1000) && (mtn1 * 3 < mtn2 * 2 || mtn2 * 3 < mtn1 * 2))
+        || ((mtn1 >= 2000 || mtn2 >= 2000) && (mtn1 * 5 < mtn2 * 4 || mtn2 * 5 < mtn1 * 4))
+        || ((mtn1 >= 4000 || mtn2 >= 4000) && c2 > c1)) {
+        return mtn1 > mtn2 ? match2 : match1;
+    }
+    // The C compares mr, a float, with the double 0.005: 0.005f lies just below 0.005, so `mr > 0.005f` is the same test.
+    if (mr > 0.005f && max(mtn1, mtn2) > 150 && (mtn1 * 2 < mtn2 * 1 || mtn2 * 2 < mtn1 * 1)) {
+        return mtn1 > mtn2 ? match2 : match1;
+    }
+    return norm1 > norm2 ? match2 : match1;
+}
+
+// bwdif's window at frame rate (yadif_common.c ff_yadif_filter_frame, deint=interlaced) for the matched picture
+// `cur`: as it is when it, or a progressive repeat-field neighbour, is not combed, else its first field deinterlaced,
+// intra while the stream's start is pending (YADIF_FIELD_END, which the window's first picture sets; the end of the
+// stream replaces it, YADIF_FIELD_BACK_END).
+static inline void iv_window(device long* state, device IVRecord* records, uint prev, uint cur, uint next,
+                             bool prev_repeat, bool next_repeat, bool start, bool finishing) {
+    if (start) { state[IV_FIELD_END] = 1; }
+    if (finishing) { state[IV_FIELD_END] = 0; }
+    bool pass = records[cur].combed == 0u || (records[prev].combed == 0u && prev_repeat)
+             || (records[next].combed == 0u && next_repeat);
+    records[cur].passthrough = pass ? 1u : 0u;
+    records[cur].intra = !pass && state[IV_FIELD_END] != 0 ? 1u : 0u;
+    if (!pass) { state[IV_FIELD_END] = 0; }
+}
+
+static inline int iv_cell(device const uint* cells, constant IVMatch& m, uint grid, int y, int x) {
+    if (y < 0 || x < 0 || y >= int(m.cells_y) || x >= int(m.cells_x)) { return 0; }
+    return int(cells[(2u + grid) * m.cells_x * m.cells_y + uint(y) * m.cells_x + uint(x)]);
+}
+
+// One picture's fieldmatch decision (filter_frame at the defaults): the sums reduced, compare_fields(c, p), the
+// scene-change test, checkmm(match, n) and the combed verdict, into the picture's record; then, with this picture as
+// bwdif's next, the window's decision for the one before it. One threadgroup of IV_THREADS.
+kernel void iv_match_decide(device const uint*  partials [[buffer(0)]],
+                            constant IVMatch&   m        [[buffer(1)]],
+                            device const uint*  stats    [[buffer(5)]],
+                            device long*        state    [[buffer(7)]],
+                            device IVRecord*    records  [[buffer(8)]],
+                            uint                tid      [[thread_index_in_threadgroup]]) {
+    threadgroup ulong sums[8][IV_THREADS];
+    threadgroup int combs[3][IV_THREADS];
+    ulong own[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint i = tid; i < m.partials; i += IV_THREADS) { own[i % 6u] += ulong(partials[i]); }
+    uint cellCount = m.cells_x * m.cells_y;
+    for (uint i = tid; i < cellCount; i += IV_THREADS) {
+        own[6] += ulong(stats[i]);
+        own[7] += ulong(stats[cellCount + i]);
+    }
+    int best[3] = {0, 0, 0};
+    uint windows = (m.cells_y + 1u) * (m.cells_x + 1u);
+    for (uint w = tid; w < windows; w += IV_THREADS) {
+        int y = int(w / (m.cells_x + 1u)) - 1, x = int(w % (m.cells_x + 1u)) - 1;
+        for (uint g = 0; g < 3u; ++g) {
+            int v = iv_cell(stats, m, g, y, x) + iv_cell(stats, m, g, y, x + 1) + iv_cell(stats, m, g, y + 1, x)
+                  + iv_cell(stats, m, g, y + 1, x + 1);
+            best[g] = max(best[g], v);
+        }
+    }
+    for (uint k = 0; k < 8u; ++k) { sums[k][tid] = own[k]; }
+    for (uint g = 0; g < 3u; ++g) { combs[g][tid] = best[g]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = IV_THREADS / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            for (uint k = 0; k < 8u; ++k) { sums[k][tid] += sums[k][tid + stride]; }
+            for (uint g = 0; g < 3u; ++g) { combs[g][tid] = max(combs[g][tid], combs[g][tid + stride]); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid != 0u) { return; }
+    if (m.reset != 0u) {
+        state[IV_LASTSCDIFF] = 0; state[IV_LASTN] = 0; state[IV_FIELD_END] = 0;
+        state[IV_START_SET] = 0; state[IV_START_PTS] = 0; state[IV_LAST_PTS] = 0; state[IV_LAST_DURATION] = 0;
+    }
+    ulong a[6] = {sums[0][0], sums[1][0], sums[2][0], sums[3][0], sums[4][0], sums[5][0]};
+    long prevDiff = long(sums[6][0]), nextDiff = long(sums[7][0]);
+    // Matches: 0 p, 1 c, 2 n.
+    uint match = iv_compare(a, 1u, 0u);
+    bool sc = false;
+    if (state[IV_LASTN] == m.emitted - 1) {
+        if (state[IV_LASTSCDIFF] > m.scthresh) { sc = true; }
+    } else if (prevDiff > m.scthresh) {
+        sc = true;
+    }
+    if (!sc) {
+        state[IV_LASTN] = m.emitted;
+        state[IV_LASTSCDIFF] = nextDiff;
+        sc = nextDiff > m.scthresh;
+    }
+    bool combed = false;
+    if (sc) {
+        // checkmm(match, n): the comb grids are the weaves p, c, n, by match.
+        int c1 = combs[match][0], c2 = combs[2][0];
+        if ((c2 * 3 < c1 || (c2 * 2 < c1 && c1 > 80)) && abs(c2 - c1) >= 30 && c2 < 80) { match = 2u; }
+        combed = combs[match][0] >= 80;
+    }
+    records[m.record] = IVRecord{match, combed ? 1u : 0u, 0u, 0u};
+    if (m.window != 0u) {
+        iv_window(state, records, m.window_prev, m.window_cur, m.record, m.prev_repeat != 0u, m.next_repeat != 0u,
+                  m.window_start != 0u, false);
+    }
+}
+
+// The window's decision for the stream's last picture, its own successor standing in for the next (end of stream).
+struct IVWindowEnd {
+    uint prev;
+    uint cur;
+    uint prev_repeat;
+    uint cur_repeat;
+    uint start;
+};
+
+kernel void iv_window_end(constant IVWindowEnd&  w       [[buffer(1)]],
+                          device long*           state   [[buffer(7)]],
+                          device IVRecord*       records [[buffer(8)]]) {
+    iv_window(state, records, w.prev, w.cur, w.cur, w.prev_repeat != 0u, w.cur_repeat != 0u, w.start != 0u, true);
+}
+
+// create_weave_frame of the match the record holds, every plane in one dispatch: c is the picture itself, p and n take
+// the rows not of `src_parity` from the previous or next picture.
+struct IVWeavePlane {
     FMPlane plane;
-    uint src_parity;
     uint out_offset;
     uint out_linesize;
 };
 
-kernel void fm_weave_out(device const uchar*  srcb   [[buffer(0)]],
-                         constant FMWeave&    w      [[buffer(1)]],
-                         device const uchar*  otherb [[buffer(5)]],
-                         device uchar*        out    [[buffer(7)]],
-                         uint2                gid    [[thread_position_in_grid]]) {
-    if (gid.x >= w.plane.width || gid.y >= w.plane.height) { return; }
+struct IVWeave {
+    PFPicture prv;
+    PFPicture src;
+    PFPicture nxt;
+    IVWeavePlane plane[3];
+    uint src_parity;     // 1 - field
+    uint record;
+};
+
+kernel void iv_weave(device const uchar*     prvb    [[buffer(0)]],
+                     constant IVWeave&       w       [[buffer(1)]],
+                     device const IVRecord*  records [[buffer(2)]],
+                     device const uchar*     srcb    [[buffer(5)]],
+                     device const uchar*     nxtb    [[buffer(6)]],
+                     device uchar*           out     [[buffer(7)]],
+                     uint3                   gid     [[thread_position_in_grid]]) {
+    constant IVWeavePlane& p = w.plane[gid.z];
+    if (gid.x >= p.plane.width || gid.y >= p.plane.height) { return; }
     int x = int(gid.x), y = int(gid.y);
-    int v = (gid.y & 1u) == w.src_parity ? fm_read(srcb, w.src, w.plane.component, x, y)
-                                         : fm_read(otherb, w.other, w.plane.component, x, y);
-    out[w.out_offset + gid.y * w.out_linesize + gid.x] = uchar(v);
+    uint match = records[w.record].match;
+    int v;
+    if (match == 1u || (gid.y & 1u) == w.src_parity) {
+        v = fm_read(srcb, w.src, p.plane.component, x, y);
+    } else if (match == 0u) {
+        v = fm_read(prvb, w.prv, p.plane.component, x, y);
+    } else {
+        v = fm_read(nxtb, w.nxt, p.plane.component, x, y);
+    }
+    out[p.out_offset + gid.y * p.out_linesize + gid.x] = uchar(v);
+}
+
+// calc_diffs' block sums, |a - b| over every plane (chroma on): one threadgroup per block of half blockx x half blocky
+// luma samples with its chroma, written whole.
+struct IVBlocksPlane {
+    FMPlane plane;
+    uint block_w;
+    uint block_h;
+};
+
+struct IVBlocks {
+    PFPicture a;
+    PFPicture b;
+    IVBlocksPlane plane[3];
+    uint planes;
+    uint blocks_x;
+};
+
+kernel void iv_blocks(device const uchar*  ab     [[buffer(0)]],
+                      constant IVBlocks&   d      [[buffer(1)]],
+                      device const uchar*  bb     [[buffer(5)]],
+                      device uint*         blocks [[buffer(8)]],
+                      uint2                tid2   [[thread_position_in_threadgroup]],
+                      uint2                tgid   [[threadgroup_position_in_grid]],
+                      uint                 tindex [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint sum;
+    if (tindex == 0u) { atomic_store_explicit(&sum, 0u, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint v = 0u;
+    for (uint c = 0; c < d.planes; ++c) {
+        constant IVBlocksPlane& p = d.plane[c];
+        if (tid2.x >= p.block_w || tid2.y >= p.block_h) { continue; }
+        uint x = tgid.x * p.block_w + tid2.x, y = tgid.y * p.block_h + tid2.y;
+        if (x < p.plane.width && y < p.plane.height) {
+            v += uint(abs(fm_read(ab, d.a, p.plane.component, int(x), int(y)) - fm_read(bb, d.b, p.plane.component, int(x), int(y))));
+        }
+    }
+    if (v) { atomic_fetch_add_explicit(&sum, v, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tindex == 0u) { blocks[tgid.y * d.blocks_x + tgid.x] = atomic_load_explicit(&sum, memory_order_relaxed); }
+}
+
+// vf_decimate.c: calc_diffs' result for the cycle's slot (the largest sum over 2 x 2 neighbouring blocks, and the
+// total; none for the stream's first picture, which has no predecessor), then, at the end of a cycle, filter_frame's
+// choice of the picture to drop and every other one's timestamp, into `results` ({pts, kept} a picture). `rescaled` is
+// each picture's pts on the output base (av_rescale_q, the caller's), `valid` whether it had one. One threadgroup.
+struct IVDecimate {
+    uint blocks_x;
+    uint blocks_y;
+    uint slot;           // the cycle's slot of this picture's differences
+    uint diffs;          // whether this picture brings differences (0 at the end of the stream)
+    uint none;           // no predecessor
+    uint count;          // pictures in the cycle when it ends here: 5, or fewer at the end of the stream; 0 otherwise
+    uint full;           // a full cycle drops one
+    uint result;         // the cycle's first result slot
+    long dupthresh;
+    long scthresh;
+    long rescaled[5];
+    uint valid[5];
+};
+
+kernel void iv_decimate(constant IVDecimate&  d       [[buffer(1)]],
+                        device const uint*    blocks  [[buffer(5)]],
+                        device long*          state   [[buffer(7)]],
+                        device long2*         results [[buffer(8)]],
+                        uint                  tid     [[thread_index_in_threadgroup]]) {
+    threadgroup long maxima[IV_THREADS];
+    threadgroup long totals[IV_THREADS];
+    long best = -1, total = 0;
+    uint nx = d.blocks_x, ny = d.blocks_y;
+    if (d.diffs != 0u && d.none == 0u) {
+        for (uint i = tid; i < nx * ny; i += IV_THREADS) {
+            total += long(blocks[i]);
+            uint y = i / nx, x = i % nx;
+            if (y + 1u < ny && x + 1u < nx) {
+                best = max(best, long(blocks[i]) + long(blocks[i + 1u]) + long(blocks[i + nx]) + long(blocks[i + nx + 1u]));
+            }
+        }
+    }
+    maxima[tid] = best;
+    totals[tid] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = IV_THREADS / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            maxima[tid] = max(maxima[tid], maxima[tid + stride]);
+            totals[tid] += totals[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid != 0u) { return; }
+    if (d.diffs != 0u) {
+        long none = 0x7fffffffffffffff;
+        state[IV_MAXBDIFF + d.slot] = d.none != 0u ? none : maxima[0];
+        state[IV_TOTDIFF + d.slot] = d.none != 0u ? none : totals[0];
+    }
+    if (d.count == 0u) { return; }
+    int drop = -1;
+    if (d.full != 0u) {
+        int scpos = -1, duppos = -1, lowest = 0;
+        for (int i = 0; i < 5; ++i) {
+            if (state[IV_TOTDIFF + i] > d.scthresh) { scpos = i; }
+            if (state[IV_MAXBDIFF + i] < state[IV_MAXBDIFF + lowest]) { lowest = i; }
+        }
+        if (state[IV_MAXBDIFF + lowest] < d.dupthresh) { duppos = lowest; }
+        state[IV_CYCLES] += 1;
+        if (duppos >= 0) { state[IV_CYCLES_WITH_DUPLICATE] += 1; }
+        drop = scpos >= 0 && duppos < 0 ? scpos : lowest;
+    }
+    for (uint i = 0; i < d.count; ++i) {
+        if (int(i) == drop) {
+            results[d.result + i] = long2(0, 0);
+            continue;
+        }
+        if (d.valid[i] != 0u && state[IV_START_SET] == 0) {
+            state[IV_START_PTS] = d.rescaled[i];
+            state[IV_START_SET] = 1;
+        }
+        long pts = state[IV_LAST_DURATION] != 0 ? state[IV_LAST_PTS] + state[IV_LAST_DURATION] : state[IV_START_PTS];
+        state[IV_LAST_DURATION] = 1;
+        state[IV_LAST_PTS] = pts;
+        results[d.result + i] = long2(pts, 1);
+    }
 }
 """
 }
