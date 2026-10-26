@@ -18,11 +18,17 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
         queue.makeCommandBuffer().map(Batch.init)
     }
 
-    /// `encode` in a batch of its own, committed; waits for it and every batch before it when `wait`.
+    /// `encode` in a pass of a batch of its own, committed; waits for it and every batch before it when `wait`.
     @discardableResult
     func run(wait: Bool = true, _ encode: (any DeinterlacePass) -> Bool) -> Bool {
-        guard let batch = makeBatch(), let pass = batch.makePass() else { return false }
-        let encoded = encode(pass)
+        runBatch(wait: wait) { batch in batch.makePass().map(encode) ?? false }
+    }
+
+    /// `encode` into a batch of its own, committed; waits for it and every batch before it when `wait`.
+    @discardableResult
+    func runBatch(wait: Bool = true, _ encode: (any DeinterlaceBatch) -> Bool) -> Bool {
+        guard let batch = makeBatch() else { return false }
+        let encoded = encode(batch)
         let done = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var failed = false
         batch.commit { failure in
@@ -74,5 +80,7 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
                                          threadsPerThreadgroup: threadsPerThreadgroup)
         }
         func barrier() { encoder.memoryBarrier(scope: [.buffers, .textures]) }
+        func waitForFence(_ fence: MTLFence) { encoder.waitForFence(fence) }
+        func updateFence(_ fence: MTLFence) { encoder.updateFence(fence) }
     }
 }

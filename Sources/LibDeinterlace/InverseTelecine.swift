@@ -78,6 +78,11 @@ public final class InverseTelecine {
     private let state: MTLBuffer
     private let records: MTLBuffer
     private let results: MTLBuffer
+    /// Updated once a push's statistics are written (the chain's pass waits for them), and once its chain work is (the
+    /// next push's chain waits, and so does any pass reading the pictures it puts out: ``fence``).
+    private let statistics: MTLFence
+    /// Updated at the end of every push's chain work: a caller's pass reading a push's outputs (its finish) waits on it.
+    public let fence: MTLFence
     private static let recordRing = 64
     private static let resultRing = 64 * Decimator.cycle
     private var nextRecord = 0
@@ -165,8 +170,10 @@ public final class InverseTelecine {
         guard let state = device.makeBuffer(length: 8 * State.words, options: .storageModeShared),
               let records = device.makeBuffer(length: 16 * Self.recordRing, options: .storageModeShared),
               let results = device.makeBuffer(length: 16 * Self.resultRing, options: .storageModeShared) else { return nil }
+        guard let statistics = device.makeFence(), let fence = device.makeFence() else { return nil }
         memset(state.contents(), 0, state.length)
         (self.state, self.records, self.results) = (state, records, results)
+        (self.statistics, self.fence) = (statistics, fence)
         var sets: [Scratch] = []
         for _ in 0..<Self.passesInFlight {
             guard let map = device.makeBuffer(length: max(sizes.map, 16), options: .storageModePrivate),
@@ -204,13 +211,25 @@ public final class InverseTelecine {
         return slot.load(as: Int64.self)
     }
 
-    /// Feeds a decoded picture (nil: end of stream), encoding its work into `pass`, and returns the film pictures it
-    /// releases. The pass's batch must start after the work of the passes pushed before it.
-    public func push(_ picture: BwdifWindow.Picture?, into pass: any DeinterlacePass) -> Pushed {
+    /// Feeds a decoded picture (nil: end of stream), encoding its work into two passes of `batch`, and returns the film
+    /// pictures it releases. The first reads only decoded pictures, so it may run beside earlier batches' work; the
+    /// second waits for it and for the previous push's chain work (``fence``), and updates ``fence`` when done. Pushes
+    /// are committed in order to one queue.
+    public func push(_ picture: BwdifWindow.Picture?, into batch: any DeinterlaceBatch) -> Pushed {
         var pushed = Pushed()
         let work = scratch[nextScratch]
         nextScratch = (nextScratch + 1) % scratch.count
-        if let matched = match(picture, work: work, pass: pass, pushed: &pushed),
+        let compared = window3(picture)
+        if let compared {
+            pushed.touched += [compared.prv, compared.src, compared.nxt]
+            guard let first = batch.makePass(), statistics(compared, work: work, pass: first) else { return pushed }
+            first.updateFence(statistics)
+        }
+        guard let pass = batch.makePass() else { return pushed }
+        pass.waitForFence(statistics)
+        pass.waitForFence(fence)
+        defer { pass.updateFence(fence) }
+        if let compared, let matched = match(compared, work: work, pass: pass, pushed: &pushed),
            let out = window(matched, finishing: false, pass: pass, pushed: &pushed) {
             decimate(out, work: work, pass: pass, pushed: &pushed)
         }
@@ -268,39 +287,54 @@ public final class InverseTelecine {
 
     // MARK: fieldmatch
 
-    /// filter_frame: `picture` nil flushes the last one. The luma differences; the scene-change test beside the field
-    /// difference map; the accumulations beside the comb counts (a scene change's alone); the decision; the weave. Each
-    /// phase behind a barrier, as it reads the one before.
-    private func match(_ picture: BwdifWindow.Picture?, work: Scratch, pass: any DeinterlacePass,
-                       pushed: inout Pushed) -> Matched? {
-        // SLIDING_FRAME_WINDOW
+    /// fieldmatch's three pictures once `picture` is in (SLIDING_FRAME_WINDOW; nil flushes the last one), and the
+    /// source's field order: nil until the window has a picture to match.
+    private func window3(_ picture: BwdifWindow.Picture?) -> Compared? {
         prv = src
         src = nxt
         if let picture { nxt = picture }
         if prv == nil { prv = src }
         guard let prv, let src, let nxt else { return nil }
-        let order = src.interlaced ? (src.topFieldFirst ? 1 : 0) : 1
-        let field = order
+        return Compared(prv: prv, src: src, nxt: nxt, field: src.interlaced ? (src.topFieldFirst ? 1 : 0) : 1)
+    }
+
+    private struct Compared {
+        let prv: BwdifWindow.Picture
+        let src: BwdifWindow.Picture
+        let nxt: BwdifWindow.Picture
+        let field: Int
+    }
+
+    /// The statistics a match reads, from the decoded pictures alone: the luma differences, then the field difference
+    /// map and its accumulations (compare_fields(c, p)).
+    private func statistics(_ c: Compared, work: Scratch, pass: any DeinterlacePass) -> Bool {
         // field ^ order is 0 at the defaults: fxo0m, the matches in their own order. compare_fields(c, p): fbase of c and
         // p is 2 - field; the map comes from the next field's rows when field is 1.
-        let fbase = 2 - field
+        let fbase = 2 - c.field
+        guard kernels.encodeClear(work.map, words: (work.map.length + 3) / 4, layout: layout, pass: pass),
+              kernels.encodeLumaDifferences(prv: c.prv.storage.planes, src: c.src.storage.planes, nxt: c.nxt.storage.planes,
+                                            layout: layout, width: width, height: height, stats: work.stats, pass: pass)
+        else { return false }
+        pass.barrier()
+        return kernels.encodeFieldMatchCompare(src: c.src.storage.planes, prev: c.src.storage.planes, next: c.prv.storage.planes,
+                                               layout: layout, width: width, height: height, fbase1: fbase, fbase2: fbase,
+                                               mapFromNextField: c.field == 1, hsub: Int(layout.log2ChromaW), map: work.map,
+                                               partials: work.partials, pass: pass)
+    }
+
+    /// filter_frame on the statistics: the scene-change test, the comb counts (a scene change's alone), the decision and
+    /// the weave, each behind a barrier on the one before.
+    private func match(_ c: Compared, work: Scratch, pass: any DeinterlacePass, pushed: inout Pushed) -> Matched? {
+        let (prv, src, nxt, field) = (c.prv, c.src, c.nxt, c.field)
         let record = UInt32(nextRecord)
         nextRecord = (nextRecord + 1) % Self.recordRing
         guard let (out, planes) = makePicture(props: src.frame, pts: src.pts) else { return nil }
-        pushed.touched += [prv, src, nxt, out]
+        pushed.touched.append(out)
         let windowArguments = windowPending(next: out)
-        guard kernels.encodeClear(work.map, words: (work.map.length + 3) / 4, layout: layout, pass: pass),
-              kernels.encodeLumaDifferences(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
-                                            layout: layout, width: width, height: height, stats: work.stats, pass: pass)
-        else { return nil }
-        pass.barrier()
         guard kernels.encodeScene(stats: work.stats, cells: cells, state: state, reset: resetPending, emitted: emitted,
-                                  scthresh: scthresh, layout: layout, pass: pass),
-              kernels.encodeFieldMatchCompare(src: src.storage.planes, prev: src.storage.planes, next: prv.storage.planes,
-                                              layout: layout, width: width, height: height, fbase1: fbase, fbase2: fbase,
-                                              mapFromNextField: field == 1, hsub: Int(layout.log2ChromaW), map: work.map,
-                                              partials: work.partials, pass: pass),
-              kernels.encodeCombCounts(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
+                                  scthresh: scthresh, layout: layout, pass: pass) else { return nil }
+        pass.barrier()
+        guard kernels.encodeCombCounts(prv: prv.storage.planes, src: src.storage.planes, nxt: nxt.storage.planes,
                                        pnParity: 1 - field, layout: layout, width: width, height: height,
                                        cthresh: Self.cthresh, stats: work.stats, pass: pass) else { return nil }
         resetPending = false

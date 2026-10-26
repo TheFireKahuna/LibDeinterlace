@@ -207,8 +207,8 @@ struct InverseTelecineReferenceTests {
         var outputs: [InverseTelecine.Output] = []
         var held: [BwdifWindow.Picture] = []
         func push(_ picture: BwdifWindow.Picture?) {
-            gpu.run(wait: false) { pass in
-                let pushed = chain.push(picture, into: pass)
+            gpu.runBatch(wait: false) { batch in
+                let pushed = chain.push(picture, into: batch)
                 outputs += pushed.outputs
                 held += pushed.touched
                 return true
