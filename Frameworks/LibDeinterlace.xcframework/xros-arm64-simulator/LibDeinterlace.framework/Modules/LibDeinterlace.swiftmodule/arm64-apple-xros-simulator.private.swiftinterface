@@ -1,0 +1,171 @@
+// swift-interface-format-version: 1.0
+// swift-compiler-version: Apple Swift version 6.4.2 (swiftlang-6.4.2.1.4 clang-2100.4.1.1)
+// swift-module-flags: -target arm64-apple-xros1.0-simulator -enable-objc-interop -enable-library-evolution -language-mode 6 -O -enable-experimental-feature DebugDescriptionMacro -module-name LibDeinterlace -package-name development
+// swift-module-flags-ignorable:  -formal-cxx-interoperability-mode=off -interface-compiler-version 6.4.2
+import AetherLibavutil
+import Foundation
+import Foundation/*.Bundle*/
+import Foundation/*.ProcessInfo*/
+import Foundation/*.URL*/
+import Metal
+import Swift
+import _Concurrency
+import _StringProcessing
+import _SwiftConcurrencyShims
+import os
+final public class BwdifWindow {
+  final public class Picture {
+    final public let storage: LibDeinterlace::BwdifWindow.LibDeinterlace::Storage
+    final public let pts: Swift::Int64
+    public init(storage: LibDeinterlace::BwdifWindow.LibDeinterlace::Storage, pts: Swift::Int64)
+    final public var frame: Swift::UnsafeMutablePointer<AetherLibavutil::AVFrame> {
+      get
+    }
+    final public var interlaced: Swift::Bool {
+      get
+    }
+    final public var topFieldFirst: Swift::Bool {
+      get
+    }
+    final public var repeatPict: Swift::Bool {
+      get
+    }
+    final public func clone(pts: Swift::Int64) -> LibDeinterlace::BwdifWindow.LibDeinterlace::Picture
+    @objc deinit
+  }
+  final public class Storage {
+    final public let frame: Swift::UnsafeMutablePointer<AetherLibavutil::AVFrame>
+    final public let planes: LibDeinterlace::PlaneSet
+    public init(frame: Swift::UnsafeMutablePointer<AetherLibavutil::AVFrame>, planes: LibDeinterlace::PlaneSet, release: (() -> Swift::Void)?)
+    @objc deinit
+  }
+  public static let referenceFormats: Swift::Set<Swift::Int32>
+  @frozen public enum Output {
+    case picture(LibDeinterlace::BwdifWindow.LibDeinterlace::Picture, pts: Swift::Int64)
+    case field(prev: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture, cur: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture, next: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture, parity: Swift::UInt32, fieldParity: Swift::UInt32, intra: Swift::Bool, pts: Swift::Int64)
+  }
+  final public let fieldRate: Swift::Bool
+  final public let outputTimeBase: AetherLibavutil::AVRational
+  public init(timeBase: AetherLibavutil::AVRational, fieldRate: Swift::Bool)
+  final public var isActive: Swift::Bool {
+    get
+  }
+  final public func push(_ picture: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture) -> [LibDeinterlace::BwdifWindow.LibDeinterlace::Output]
+  final public func finish() -> [LibDeinterlace::BwdifWindow.LibDeinterlace::Output]
+  final public func reset()
+  @objc deinit
+}
+final public class InverseTelecine {
+  public static let formats: Swift::Set<Swift::Int32>
+  public static func takes(format: AetherLibavutil::AVPixelFormat, width: Swift::Int, height: Swift::Int) -> Swift::Bool
+  public typealias PictureMaker = (AetherLibavutil::AVPixelFormat, Swift::Int, Swift::Int) -> (planes: LibDeinterlace::PlaneSet, release: () -> Swift::Void)?
+  public struct Output {
+    public let picture: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture
+    public let passthrough: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture
+    public let passedThrough: (buffer: any Metal::MTLBuffer, offset: Swift::Int)
+    public let kept: (buffer: any Metal::MTLBuffer, offset: Swift::Int)?
+  }
+  final public func shown(_ output: LibDeinterlace::InverseTelecine.LibDeinterlace::Output) -> LibDeinterlace::BwdifWindow.LibDeinterlace::Picture
+  public struct Pushed {
+    public var outputs: [LibDeinterlace::InverseTelecine.LibDeinterlace::Output]
+    public var touched: [LibDeinterlace::BwdifWindow.LibDeinterlace::Picture]
+  }
+  public static let passesInFlight: Swift::Int
+  final public let outputTimeBase: AetherLibavutil::AVRational
+  final public let fence: any Metal::MTLFence
+  public static let combpel: Swift::Int
+  public static let cthresh: Swift::Int
+  public init?(kernels: LibDeinterlace::DeinterlaceKernels, makePicture: @escaping LibDeinterlace::InverseTelecine.LibDeinterlace::PictureMaker, format: AetherLibavutil::AVPixelFormat, width: Swift::Int, height: Swift::Int, timeBase: AetherLibavutil::AVRational, frameRate: AetherLibavutil::AVRational, decimates: Swift::Bool = true)
+  final public var cycles: Swift::Int {
+    get
+  }
+  final public var cyclesWithDuplicate: Swift::Int {
+    get
+  }
+  final public func resolve(_ output: LibDeinterlace::InverseTelecine.LibDeinterlace::Output) -> Swift::Int64?
+  final public func push(_ picture: LibDeinterlace::BwdifWindow.LibDeinterlace::Picture?, into batch: any LibDeinterlace::DeinterlaceBatch) -> LibDeinterlace::InverseTelecine.LibDeinterlace::Pushed
+  final public func reset()
+  @objc deinit
+}
+final public class DeinterlaceKernels : @unchecked Swift::Sendable {
+  final public let device: any Metal::MTLDevice
+  public init(submission: any LibDeinterlace::DeinterlaceSubmission)
+  public static let commonFormats: [AetherLibavutil::AVPixelFormat]
+  final public func prewarm(_ formats: [AetherLibavutil::AVPixelFormat] = DeinterlaceKernels.commonFormats)
+  @_spi(Archive) public static func archiveRequests(_ formats: [AetherLibavutil::AVPixelFormat] = commonFormats, library: any Metal::MTLLibrary) -> [LibDeinterlace::DeinterlacePipelineRequest]
+  public struct BwdifField {
+    public var prev: LibDeinterlace::PlaneSet
+    public var cur: LibDeinterlace::PlaneSet
+    public var next: LibDeinterlace::PlaneSet
+    public var parity: Swift::UInt32
+    public var fieldParity: Swift::UInt32
+    public var intra: Swift::Bool
+    public init(prev: LibDeinterlace::PlaneSet, cur: LibDeinterlace::PlaneSet, next: LibDeinterlace::PlaneSet, parity: Swift::UInt32, fieldParity: Swift::UInt32, intra: Swift::Bool)
+  }
+  final public func encodeBwdif(_ field: LibDeinterlace::DeinterlaceKernels.LibDeinterlace::BwdifField, layout: LibDeinterlace::PictureLayout, width: Swift::Int, height: Swift::Int, into out: LibDeinterlace::PlaneSet, pass: any LibDeinterlace::DeinterlacePass) -> Swift::Bool
+  final public func combScore(src: LibDeinterlace::PlaneSet, other: LibDeinterlace::PlaneSet, srcParity: Swift::Int, layout: LibDeinterlace::PictureLayout, width: Swift::Int, height: Swift::Int, cthresh: Swift::Int) -> Swift::Int?
+  @objc deinit
+}
+public struct PlaneSet {
+  public var buffer: any Metal::MTLBuffer
+  public var offsets: [Swift::UInt32]
+  public var linesizes: [Swift::UInt32]
+  public init(buffer: any Metal::MTLBuffer, offsets: [Swift::UInt32], linesizes: [Swift::UInt32])
+}
+public struct ComponentLayout : Swift::Hashable, Swift::Sendable {
+  public var plane: Swift::UInt32
+  public var step: Swift::UInt32
+  public var offset: Swift::UInt32
+  public var shift: Swift::UInt32
+  public var depth: Swift::UInt32
+  public init(plane: Swift::UInt32, step: Swift::UInt32, offset: Swift::UInt32, shift: Swift::UInt32, depth: Swift::UInt32)
+  public static func == (a: LibDeinterlace::ComponentLayout, b: LibDeinterlace::ComponentLayout) -> Swift::Bool
+  public func hash(into hasher: inout Swift::Hasher)
+  public var hashValue: Swift::Int {
+    get
+  }
+}
+public struct PictureLayout : Swift::Hashable, Swift::Sendable {
+  public var components: [LibDeinterlace::ComponentLayout]
+  public var bigEndian: Swift::Bool
+  public var log2ChromaW: Swift::UInt32
+  public var log2ChromaH: Swift::UInt32
+  public init(components: [LibDeinterlace::ComponentLayout], bigEndian: Swift::Bool, log2ChromaW: Swift::UInt32, log2ChromaH: Swift::UInt32)
+  public init?(format: AetherLibavutil::AVPixelFormat)
+  public var isGray: Swift::Bool {
+    get
+  }
+  public func size(component c: Swift::Int, width: Swift::Int, height: Swift::Int) -> (width: Swift::Int, height: Swift::Int)
+  public static func == (a: LibDeinterlace::PictureLayout, b: LibDeinterlace::PictureLayout) -> Swift::Bool
+  public func hash(into hasher: inout Swift::Hasher)
+  public var hashValue: Swift::Int {
+    get
+  }
+}
+public protocol DeinterlaceSubmission : AnyObject, Swift::Sendable {
+  var device: any Metal::MTLDevice { get }
+  func makeComputePipeline(_ request: LibDeinterlace::DeinterlacePipelineRequest) throws -> any Metal::MTLComputePipelineState
+  func makeBatch() -> (any LibDeinterlace::DeinterlaceBatch)?
+}
+public struct DeinterlacePipelineRequest {
+  public let library: any Metal::MTLLibrary
+  public let function: Swift::String
+  public let constants: Metal::MTLFunctionConstantValues
+  public let archive: Foundation::URL?
+}
+public protocol DeinterlaceBatch : AnyObject {
+  func makePass() -> (any LibDeinterlace::DeinterlacePass)?
+  func commit(_ completion: @escaping @Sendable (_ failure: Swift::String?) -> Swift::Void)
+}
+public protocol DeinterlacePass : AnyObject {
+  func setPipeline(_ pipeline: any Metal::MTLComputePipelineState)
+  func setBuffer(_ buffer: any Metal::MTLBuffer, offset: Swift::Int, index: Swift::Int)
+  func setBytes(_ bytes: Swift::UnsafeRawBufferPointer, index: Swift::Int)
+  func dispatchThreads(_ grid: Metal::MTLSize, threadsPerThreadgroup: Metal::MTLSize)
+  func dispatchThreadgroups(_ groups: Metal::MTLSize, threadsPerThreadgroup: Metal::MTLSize)
+  func dispatchThreadgroups(indirectBuffer: any Metal::MTLBuffer, offset: Swift::Int, threadsPerThreadgroup: Metal::MTLSize)
+  func fill(_ buffer: any Metal::MTLBuffer, range: Swift::Range<Swift::Int>, value: Swift::UInt8)
+  func barrier()
+  func waitForFence(_ fence: any Metal::MTLFence)
+  func updateFence(_ fence: any Metal::MTLFence)
+}

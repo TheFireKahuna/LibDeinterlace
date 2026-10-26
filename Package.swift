@@ -2,8 +2,10 @@
 
 import PackageDescription
 
-// A dynamic library on purpose: it carries code derived from FFmpeg under LGPL-2.1-or-later, and an app that links it
-// dynamically can have it replaced, as with FFmpegBuild's frameworks.
+// LibDeinterlace as players take it: the XCFramework Development/Scripts/build-xcframework.sh builds from the source
+// package in Development/ (where the tests run). Library evolution gives it a stable ABI, so an app can have a rebuilt
+// LibDeinterlace dropped in, as LGPL-2.1 asks of the FFmpeg-derived code it carries; it links dynamically, as
+// FFmpegBuild's frameworks do.
 let package = Package(
     name: "LibDeinterlace",
     platforms: [
@@ -13,27 +15,19 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
-        .library(name: "LibDeinterlace", type: .dynamic, targets: ["LibDeinterlace"]),
+        .library(name: "LibDeinterlace", targets: ["LibDeinterlace", "LibDeinterlaceLinkage"]),
     ],
     dependencies: [
         .package(url: "https://github.com/TheFireKahuna/FFmpegBuild", .upToNextMinor(from: "3.10.1")),
     ],
     targets: [
+        .binaryTarget(name: "LibDeinterlace", path: "Frameworks/LibDeinterlace.xcframework"),
+        // The framework's interface imports AetherLibavutil and its binary links it: this brings FFmpegBuild's into
+        // the app with it.
         .target(
-            name: "LibDeinterlace",
-            dependencies: [
-                .product(name: "AetherLibavutil", package: "FFmpegBuild"),
-            ],
-            path: "Sources/LibDeinterlace"
-        ),
-        .testTarget(
-            name: "LibDeinterlaceTests",
-            dependencies: [
-                "LibDeinterlace",
-                // The umbrella product: libavfilter, the reference, needs the rest of FFmpeg at run time.
-                .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
-            ],
-            path: "Tests/LibDeinterlaceTests"
+            name: "LibDeinterlaceLinkage",
+            dependencies: [.product(name: "AetherLibavutil", package: "FFmpegBuild")],
+            path: "Linkage"
         ),
     ]
 )
