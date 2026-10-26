@@ -435,13 +435,6 @@ kernel void fm_comb(device const uchar*  srcb   [[buffer(0)]],
     atomic_fetch_add_explicit(&cells[uint(y >> 3) * b.cells_x + uint(x >> 3)], 1u, memory_order_relaxed);
 }
 
-// The zero-filled buffers a picture's dispatches write into: the diff map's rows the C never writes are read as 0.
-kernel void iv_clear(constant uint&  count [[buffer(1)]],
-                     device uint*    words [[buffer(8)]],
-                     uint            gid   [[thread_position_in_grid]]) {
-    if (gid < count) { words[gid] = 0u; }
-}
-
 // MARK: - Inverse telecine's decisions on the GPU
 
 // The chain's state, carried from picture to picture in one buffer of 64-bit words (InverseTelecine.State).

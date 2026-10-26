@@ -47,7 +47,7 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
 
         func makePass() -> (any DeinterlacePass)? {
             open?.encoder.endEncoding()
-            open = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent).map(Pass.init)
+            open = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent).map { Pass($0, commandBuffer: commandBuffer) }
             return open
         }
 
@@ -59,13 +59,38 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
         }
     }
 
+    /// A compute encoder, ended for a blit encoder at each fill and started again after it, its bindings carried over.
     private final class Pass: DeinterlacePass {
-        let encoder: MTLComputeCommandEncoder
+        let commandBuffer: MTLCommandBuffer
+        var encoder: MTLComputeCommandEncoder
+        private var pipeline: MTLComputePipelineState?
+        private var buffers: [Int: (MTLBuffer, Int)] = [:]
+        private var waits: [MTLFence] = []
 
-        init(_ encoder: MTLComputeCommandEncoder) { self.encoder = encoder }
+        init(_ encoder: MTLComputeCommandEncoder, commandBuffer: MTLCommandBuffer) {
+            self.encoder = encoder
+            self.commandBuffer = commandBuffer
+        }
 
-        func setPipeline(_ pipeline: MTLComputePipelineState) { encoder.setComputePipelineState(pipeline) }
-        func setBuffer(_ buffer: MTLBuffer, offset: Int, index: Int) { encoder.setBuffer(buffer, offset: offset, index: index) }
+        func fill(_ buffer: MTLBuffer, range: Range<Int>, value: UInt8) {
+            encoder.endEncoding()
+            let blit = commandBuffer.makeBlitCommandEncoder()!
+            blit.fill(buffer: buffer, range: range, value: value)
+            blit.endEncoding()
+            encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent)!
+            for fence in waits { encoder.waitForFence(fence) }
+            if let pipeline { encoder.setComputePipelineState(pipeline) }
+            for (index, (buffer, offset)) in buffers { encoder.setBuffer(buffer, offset: offset, index: index) }
+        }
+
+        func setPipeline(_ pipeline: MTLComputePipelineState) {
+            self.pipeline = pipeline
+            encoder.setComputePipelineState(pipeline)
+        }
+        func setBuffer(_ buffer: MTLBuffer, offset: Int, index: Int) {
+            buffers[index] = (buffer, offset)
+            encoder.setBuffer(buffer, offset: offset, index: index)
+        }
         func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int) {
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: index)
         }
@@ -80,7 +105,10 @@ final class Metal3Submission: DeinterlaceSubmission, @unchecked Sendable {
                                          threadsPerThreadgroup: threadsPerThreadgroup)
         }
         func barrier() { encoder.memoryBarrier(scope: [.buffers, .textures]) }
-        func waitForFence(_ fence: MTLFence) { encoder.waitForFence(fence) }
+        func waitForFence(_ fence: MTLFence) {
+            waits.append(fence)
+            encoder.waitForFence(fence)
+        }
         func updateFence(_ fence: MTLFence) { encoder.updateFence(fence) }
     }
 }

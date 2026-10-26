@@ -179,7 +179,8 @@ public final class InverseTelecine {
         (self.statistics, self.fence) = (statistics, fence)
         var sets: [Scratch] = []
         for _ in 0..<Self.passesInFlight {
-            guard let map = device.makeBuffer(length: max(sizes.map, 16), options: .storageModePrivate),
+            // Whole words, as a fill takes.
+            guard let map = device.makeBuffer(length: max((sizes.map + 3) & ~3, 16), options: .storageModePrivate),
                   let partials = device.makeBuffer(length: 4 * max(sizes.partials, 4), options: .storageModePrivate),
                   let stats = device.makeBuffer(length: 4 * DeinterlaceKernels.statisticsLength(cells: cells.x * cells.y),
                                                 options: .storageModePrivate),
@@ -320,8 +321,9 @@ public final class InverseTelecine {
         // field ^ order is 0 at the defaults: fxo0m, the matches in their own order. compare_fields(c, p): fbase of c and
         // p is 2 - field; the map comes from the next field's rows when field is 1.
         let fbase = 2 - c.field
-        guard kernels.encodeClear(work.map, words: (work.map.length + 3) / 4, layout: layout, pass: pass),
-              kernels.encodeLumaDifferences(prv: c.prv.storage.planes, src: c.src.storage.planes, nxt: c.nxt.storage.planes,
+        // The diff map's rows the C never writes are read as 0.
+        pass.fill(work.map, range: 0..<work.map.length, value: 0)
+        guard kernels.encodeLumaDifferences(prv: c.prv.storage.planes, src: c.src.storage.planes, nxt: c.nxt.storage.planes,
                                             layout: layout, width: width, height: height, stats: work.stats, pass: pass)
         else { return false }
         pass.barrier()

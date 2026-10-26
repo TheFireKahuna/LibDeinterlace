@@ -213,18 +213,6 @@ public final class DeinterlaceKernels: @unchecked Sendable {
 
     // MARK: Inverse telecine's dispatches (InverseTelecine)
 
-    /// Zeroes `words` 32-bit words of `buffer`.
-    func encodeClear(_ buffer: MTLBuffer, words count: Int, layout: PictureLayout, pass: any DeinterlacePass) -> Bool {
-        guard let clear = try? pipeline(for: layout, function: "iv_clear") else { return false }
-        pass.setPipeline(clear)
-        pass.setBuffer(buffer, offset: 0, index: 8)
-        var arguments = Arguments()
-        arguments.words([UInt32(count)])
-        arguments.bind(pass, index: 1)
-        pass.dispatchThreads(MTLSize(width: max(count, 1), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        return true
-    }
-
     /// The sizes of compare_fields' working buffers for pictures of this layout: the diff map (one byte a sample, every
     /// plane) and the accumulations (six words a threadgroup of the shared grid, every plane).
     func fieldMatchSizes(layout: PictureLayout, width: Int, height: Int, hsub: Int) -> (map: Int, partials: Int)? {

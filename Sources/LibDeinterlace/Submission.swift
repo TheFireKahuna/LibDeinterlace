@@ -34,6 +34,9 @@ public protocol DeinterlacePass: AnyObject {
     func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize)
     /// Threadgroups counted on the GPU: three 32-bit words at `offset` (a dimension of 0 dispatches nothing).
     func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize)
+    /// Every byte of `range` (offset and length multiples of 4) set to `value`, ordered by ``barrier()`` and fences as
+    /// a dispatch is.
+    func fill(_ buffer: MTLBuffer, range: Range<Int>, value: UInt8)
     /// Every dispatch after this sees every write before it.
     func barrier()
     /// The dispatches after this wait until `fence` has been updated: by the last pass committed to the same queue
