@@ -8,7 +8,7 @@
 # them. Metal takes an archive only on the OS release it was built for (TVOS_ARCHIVE_OS); on any other release, and on
 # GPUs it was not built for, the pipelines are compiled when the player prewarms them.
 #
-# Needs Xcode 27.2 (DEVELOPER_DIR=~/Downloads/Xcode-beta.app/Contents/Developer: metal-tt) on macOS 26 or later.
+# Needs Xcode 27.2 (metal-tt) on macOS 26 or later.
 set -euo pipefail
 
 HERE=${0:A:h}
