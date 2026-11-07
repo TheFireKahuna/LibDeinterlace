@@ -42,9 +42,9 @@ public final class DeinterlaceKernels: @unchecked Sendable {
 
     /// The pipelines translated ahead of time for the GPUs the bundle was built for (a tvOS device's: the A15's), which
     /// a Metal 4 compiler takes a pipeline from instead of compiling it; a bundle built for another platform carries
-    /// none (Scripts/build-xcframework.sh).
+    /// none (Scripts/build-xcframework.sh). It ships lzfse-compressed (``DeinterlacePipelineRequest/archive``).
     static let archiveName = "LibDeinterlace-pipelines"
-    static let archive = Bundle.module.url(forResource: archiveName, withExtension: "metallib")
+    static let archive = Bundle.module.url(forResource: archiveName, withExtension: "metallib.lzfse")
 
     /// The function constants that specialise a kernel for `layout` (the shader's LD_*: plane, step, offset, shift and
     /// depth per component, then big-endian).

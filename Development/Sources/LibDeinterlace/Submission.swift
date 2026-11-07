@@ -19,7 +19,10 @@ public protocol DeinterlaceSubmission: AnyObject, Sendable {
 
 /// A pipeline the library needs: `function` of its precompiled `library`, specialised with `constants`. `archive` is the
 /// library's binary archive for this build's GPUs (a Metal 4 archive the build translated ahead of time; nil where the
-/// bundle carries none), which a Metal 4 compiler can take the pipeline from instead of compiling it.
+/// bundle carries none), which a Metal 4 compiler can take the pipeline from instead of compiling it. The file is the
+/// archive lzfse-compressed (`.metallib.lzfse`): a raw archive is a Mach-O GPU binary, which App Store signing takes for
+/// code and cannot sign. The caller decompresses it (Foundation's `NSData.decompressed(using: .lzfse)`) to a file of its
+/// own and loads that.
 public struct DeinterlacePipelineRequest {
     public let library: MTLLibrary
     public let function: String

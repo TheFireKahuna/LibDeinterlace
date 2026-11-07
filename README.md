@@ -55,6 +55,8 @@ LibDeinterlace dropped in, which LGPL-2.1 asks for. Public enums are `@frozen` o
 Shaders are precompiled: each slice's bundle carries `default.metallib`, and the tvOS device slice also carries a Metal 4
 binary archive of every pipeline the library prewarms, translated ahead of time for the A15 (Apple TV 4K, 3rd
 generation), so a Metal 4 compiler given the request's archive takes those pipelines from it instead of compiling them.
+The archive ships lzfse-compressed (`LibDeinterlace-pipelines.metallib.lzfse`), since a raw archive is a Mach-O GPU
+binary that App Store signing cannot sign: the caller decompresses the request's `archive` to a file and loads that.
 Metal takes an archive only on the OS release it was built for (tvOS 27); elsewhere, and on other GPUs, pipelines
 compile. Call `DeinterlaceKernels.prewarm(_:)` once, early, off the main thread, for the formats a stream will bring,
 so no picture waits for a pipeline.

@@ -4,7 +4,7 @@
 # Every platform's framework, built with library evolution (a stable ABI and a .swiftinterface, so a rebuilt library
 # drops into an app as LGPL-2.1 asks), carries its precompiled shaders (the module's bundle, default.metallib). The tvOS
 # device slice also carries a Metal 4 binary archive of every pipeline the library prewarms, translated ahead of time
-# for the A15 (Apple TV 4K, 3rd generation): its compiler takes those pipelines from the archive instead of compiling
+# for the A15 (Apple TV 4K, 3rd generation) and lzfse-compressed (LibDeinterlace-pipelines.metallib.lzfse): its compiler takes those pipelines from the archive instead of compiling
 # them. Metal takes an archive only on the OS release it was built for (TVOS_ARCHIVE_OS); on any other release, and on
 # GPUs it was not built for, the pipelines are compiled when the player prewarms them.
 #
@@ -82,7 +82,11 @@ script=$DD/pipelines.mtl4-json
 $DEV/.build/release/Harvest $bundle/default.metallib $script
 gpus=()
 for gpu in $ARCHIVE_GPUS; do gpus+=(-arch $gpu); done
-xcrun metal-tt $gpus -tvos-version-min $TVOS_ARCHIVE_OS $bundle/default.metallib $script -o $bundle/$NAME-pipelines.metallib
+# Shipped lzfse-compressed: a raw archive is a Mach-O GPU binary, which App Store signing cannot sign.
+raw=$DD/$NAME-pipelines.metallib
+xcrun metal-tt $gpus -tvos-version-min $TVOS_ARCHIVE_OS $bundle/default.metallib $script -o $raw
+compression_tool -encode -a lzfse -i $raw -o $bundle/$NAME-pipelines.metallib.lzfse
+print "archive: $(stat -f %z $raw) bytes unpacked"
 
 mkdir -p $ROOT/Frameworks
 output=$ROOT/Frameworks/$NAME.xcframework
