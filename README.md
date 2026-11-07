@@ -26,7 +26,7 @@ The library owns no command queue and makes no pipeline itself. Its GPU work goe
 (`DeinterlaceSubmission`, with `DeinterlaceBatch` and `DeinterlacePass`): `encodeBwdif` encodes into a pass of the
 caller's batch, so a deinterlaced field can share one submission with the caller's own passes, and every pipeline is
 the caller's to make from a `DeinterlacePipelineRequest` (the precompiled library, a function, its constants, the
-binary archive). The protocols are bindings by index, pipelines, small constant arguments, fills, dispatches (direct
+binary archive). The protocols are bindings by index, pipelines, small constant arguments, dispatches (direct
 and indirect), barriers and fences, so a caller can implement them over Metal 4 or Metal 3.
 
 Inverse telecine never waits for the GPU. fieldmatch's decisions (compare_fields, the scene-change test, checkmm),

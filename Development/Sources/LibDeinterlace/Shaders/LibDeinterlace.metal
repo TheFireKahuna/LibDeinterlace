@@ -249,7 +249,9 @@ static inline int fm_dp(device const uchar* prv, device const uchar* nxt, consta
                - fm_read(nxt, m.nxt, m.plane.component, u, int(m.base2) - 2 + 2 * k));
 }
 
-// One thread per map sample of the rows y = 2, 4, ... < height - 2 (i = (y - 2) / 2), x = 1 ... width - 2.
+// One thread per map sample of the rows y = 2, 4, ... < height - 2 (i = (y - 2) / 2), x = 1 ... width - 2, and of
+// the map rows one step before and after them (i = -1 and the first i past the end), which compare_fields reads as 0
+// and build_diff_map never writes: those threads write 0, so the map needs no clearing between pictures.
 kernel void fm_diffmap(device const uchar*   prv  [[buffer(0)]],
                        constant FMDiffMaps&  maps [[buffer(1)]],
                        device const uchar*   nxt  [[buffer(5)]],
@@ -258,9 +260,14 @@ kernel void fm_diffmap(device const uchar*   prv  [[buffer(0)]],
     constant FMDiffMap& m = maps.plane[gid.z];
     int width = int(m.plane.width), height = int(m.plane.height);
     int x = int(gid.x) + 1;
-    int i = int(gid.y);
+    int i = int(gid.y) - 1;
     int y = 2 + 2 * i;
-    if (x >= width - 1 || y >= height - 2) { return; }
+    if (x >= width - 1 || y >= height) { return; }
+    if (i < 0 || y >= height - 2) {
+        int row = int(m.map_start) + 2 * i;
+        if (row >= 0 && row < height) { map[m.map_offset + uint(row) * uint(width) + uint(x)] = 0; }
+        return;
+    }
     #define DP(k, u) fm_dp(prv, nxt, m, (k), (u))
     int diff = DP(i + 1, x);
     uchar v = 0;

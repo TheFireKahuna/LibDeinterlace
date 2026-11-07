@@ -306,7 +306,7 @@ public final class DeinterlaceKernels: @unchecked Sendable {
     }
 
     /// compare_fields(match1, match2, field) with mchroma on: every plane's field difference map (build_diff_map), then,
-    /// behind a barrier, the accumulations into `partials`. `map` must be zeroed and visible to this pass. `prev` is
+    /// behind a barrier, the accumulations into `partials`. Every map row the accumulations read is written here. `prev` is
     /// select_frame(match1), `next` select_frame(match2); `fbase1` / `fbase2` are get_field_base of each;
     /// `mapFromNextField` says which of build_diff_map's two calls the C makes (its rows fbase, or fbase + 2).
     func encodeFieldMatchCompare(src: PlaneSet, prev: PlaneSet, next: PlaneSet, layout: PictureLayout, width: Int, height: Int,
@@ -335,7 +335,8 @@ public final class DeinterlaceKernels: @unchecked Sendable {
         pass.setBuffer(next.buffer, offset: 0, index: 5)
         pass.setBuffer(map, offset: 0, index: 7)
         maps.bind(pass, index: 1)
-        pass.dispatchThreads(MTLSize(width: max(sizes.map { $0.width - 2 }.max()!, 1), height: max(sizes.map { ($0.height - 3) / 2 }.max()!, 1),
+        // The map's rows, and the zero row before and after them.
+        pass.dispatchThreads(MTLSize(width: max(sizes.map { $0.width - 2 }.max()!, 1), height: max(sizes.map { ($0.height - 3) / 2 }.max()!, 0) + 2,
                                      depth: planes), threadsPerThreadgroup: group(diffmap))
         pass.barrier()
         // FMCompares
