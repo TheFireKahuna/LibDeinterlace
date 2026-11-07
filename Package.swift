@@ -18,7 +18,7 @@ let package = Package(
         .library(name: "LibDeinterlace", targets: ["LibDeinterlace", "LibDeinterlaceLinkage"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/TheFireKahuna/FFmpegBuild", "3.10.1-fire.1"..<"3.11.0"),
+        .package(url: "https://github.com/TheFireKahuna/FFmpegBuild", "3.13.0-fire.1"..<"3.14.0"),
     ],
     targets: [
         .binaryTarget(name: "LibDeinterlace", path: "Frameworks/LibDeinterlace.xcframework"),
