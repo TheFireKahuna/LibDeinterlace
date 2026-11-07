@@ -164,7 +164,6 @@ public protocol DeinterlacePass : AnyObject {
   func dispatchThreads(_ grid: Metal::MTLSize, threadsPerThreadgroup: Metal::MTLSize)
   func dispatchThreadgroups(_ groups: Metal::MTLSize, threadsPerThreadgroup: Metal::MTLSize)
   func dispatchThreadgroups(indirectBuffer: any Metal::MTLBuffer, offset: Swift::Int, threadsPerThreadgroup: Metal::MTLSize)
-  func fill(_ buffer: any Metal::MTLBuffer, range: Swift::Range<Swift::Int>, value: Swift::UInt8)
   func barrier()
   func waitForFence(_ fence: any Metal::MTLFence)
   func updateFence(_ fence: any Metal::MTLFence)
