@@ -52,9 +52,11 @@ visionOS, devices and simulators) and brings FFmpegBuild's `AetherLibavutil`, wh
 it. The framework is built with library evolution: its `.swiftinterface` is a stable ABI, so an app can have a rebuilt
 LibDeinterlace dropped in, which LGPL-2.1 asks for. Public enums are `@frozen` only where no further case can exist.
 
-Shaders are precompiled: each slice's bundle carries `default.metallib`, and the tvOS device slice also carries a Metal 4
+Shaders are precompiled: each slice's bundle carries `default.metallib`, and the tvOS device slice also carries a
 binary archive of every pipeline the library prewarms, translated ahead of time for the A15 (Apple TV 4K, 3rd
-generation), so a Metal 4 compiler given the request's archive takes those pipelines from it instead of compiling them.
+generation, Metal 4) and the A12 (2nd generation, Metal 3), so the caller's Metal given the request's archive (a Metal 4
+compiler, or on Metal 3 a pipeline descriptor's binary archives) takes those pipelines from it instead of compiling
+them; Metal takes the slice of the GPU it runs on.
 The archive ships lzfse-compressed (`LibDeinterlace-pipelines.metallib.lzfse`), since a raw archive is a Mach-O GPU
 binary that App Store signing cannot sign: the caller decompresses the request's `archive` to a file and loads that.
 Metal takes an archive only on the OS release it was built for (tvOS 27); elsewhere, and on other GPUs, pipelines
@@ -66,7 +68,8 @@ so no picture waits for a pipeline.
 The source package is `Development/`: `cd Development && swift test`, and `Development/Scripts/build-xcframework.sh`
 (Xcode 27.2, macOS 26 or later) rebuilds `Frameworks/LibDeinterlace.xcframework`: every slice with library evolution,
 the shaders compiled with the IEEE math the C uses (`#pragma METAL fp math_mode(safe)`), and the archive recorded by a
-Metal 4 compiler from the tvOS slice's own `default.metallib` (`Sources/Harvest`) and translated by `metal-tt`.
+Metal 4 compiler from the tvOS slice's own `default.metallib` (`Sources/Harvest`, which writes the same pipelines as a
+Metal 3 script for the A12), translated by `metal-tt` for each GPU and joined by `metal-lipo`.
 
 ## Tests
 

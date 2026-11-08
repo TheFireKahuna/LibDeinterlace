@@ -9,8 +9,8 @@ import Metal
 /// (``DeinterlaceKernels/encodeBwdif(_:layout:width:height:into:pass:)``).
 public protocol DeinterlaceSubmission: AnyObject, Sendable {
     var device: MTLDevice { get }
-    /// The compute pipeline `request` describes, made by the caller's Metal: on Metal 4, its compiler, looking in the
-    /// request's archive first; before it, the device. The library calls this once per pipeline and keeps the result.
+    /// The compute pipeline `request` describes, made by the caller's Metal, looking in the request's archive first: on
+    /// Metal 4, its compiler; before it, the device. The library calls this once per pipeline and keeps the result.
     func makeComputePipeline(_ request: DeinterlacePipelineRequest) throws -> MTLComputePipelineState
     /// A new batch. Work that carries state from one batch to the next (inverse telecine's) orders itself with fences,
     /// so a batch need not wait for the ones before it.
@@ -18,8 +18,9 @@ public protocol DeinterlaceSubmission: AnyObject, Sendable {
 }
 
 /// A pipeline the library needs: `function` of its precompiled `library`, specialised with `constants`. `archive` is the
-/// library's binary archive for this build's GPUs (a Metal 4 archive the build translated ahead of time; nil where the
-/// bundle carries none), which a Metal 4 compiler can take the pipeline from instead of compiling it. The file is the
+/// library's binary archive for this build's GPUs (translated ahead of time, a slice per GPU; nil where the bundle
+/// carries none), which the caller's Metal 4 compiler, or on Metal 3 a pipeline descriptor's binary archives, can take
+/// the pipeline from instead of compiling it. The file is the
 /// archive lzfse-compressed (`.metallib.lzfse`): a raw archive is a Mach-O GPU binary, which App Store signing takes for
 /// code and cannot sign. The caller decompresses it (Foundation's `NSData.decompressed(using: .lzfse)`) to a file of its
 /// own and loads that.

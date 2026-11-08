@@ -3,8 +3,8 @@
 #
 # Every platform's framework, built with library evolution (a stable ABI and a .swiftinterface, so a rebuilt library
 # drops into an app as LGPL-2.1 asks), carries its precompiled shaders (the module's bundle, default.metallib). The tvOS
-# device slice also carries a Metal 4 binary archive of every pipeline the library prewarms, translated ahead of time
-# for the A15 (Apple TV 4K, 3rd generation) and lzfse-compressed (LibDeinterlace-pipelines.metallib.lzfse): its compiler takes those pipelines from the archive instead of compiling
+# device slice also carries a binary archive of every pipeline the library prewarms, translated ahead of time for the
+# A15 (Apple TV 4K, 3rd generation, Metal 4) and the A12 (2nd generation, Metal 3) and lzfse-compressed (LibDeinterlace-pipelines.metallib.lzfse): its compiler takes those pipelines from the archive instead of compiling
 # them. Metal takes an archive only on the OS release it was built for (TVOS_ARCHIVE_OS); on any other release, and on
 # GPUs it was not built for, the pipelines are compiled when the player prewarms them.
 #
@@ -17,7 +17,8 @@ ROOT=${DEV:h}
 NAME=LibDeinterlace
 DD=${DD:-$DEV/.build/xcframework}
 TVOS_ARCHIVE_OS=${TVOS_ARCHIVE_OS:-27.0}
-ARCHIVE_GPUS=(applegpu_g14p)
+METAL4_GPU=applegpu_g14p
+METAL3_GPU=applegpu_g11p
 
 # destination : products directory suffix
 SLICES=(
@@ -74,19 +75,21 @@ for slice in $SLICES; do
 done
 
 # The tvOS device slice's archive: the prewarm's pipelines, specialised from the very default.metallib the slice ships
-# (an archive entry names its library's functions), recorded by a Metal 4 compiler on this Mac, then translated.
-print "== archive (tvOS $TVOS_ARCHIVE_OS: ${ARCHIVE_GPUS[*]})"
+# (an archive entry names its library's functions), recorded by a Metal 4 compiler on this Mac
+# and written again as a Metal 3 script (a Metal 4 script translates for no GPU without Metal 4), each translated for its
+# GPU, the two joined into one archive from which Metal takes the slice of the GPU it runs on, through either API.
+print "== archive (tvOS $TVOS_ARCHIVE_OS: $METAL4_GPU from the Metal 4 script, $METAL3_GPU from the Metal 3 one)"
 swift build -c release --product Harvest -q
 bundle=$ASSEMBLED/release-appletvos/$NAME.framework/${NAME}_$NAME.bundle
 script=$DD/pipelines.mtl4-json
 $DEV/.build/release/Harvest $bundle/default.metallib $script
-gpus=()
-for gpu in $ARCHIVE_GPUS; do gpus+=(-arch $gpu); done
 # Shipped lzfse-compressed: a raw archive is a Mach-O GPU binary, which App Store signing cannot sign.
 raw=$DD/$NAME-pipelines.metallib
-xcrun metal-tt $gpus -tvos-version-min $TVOS_ARCHIVE_OS $bundle/default.metallib $script -o $raw
+xcrun metal-tt -arch $METAL4_GPU -tvos-version-min $TVOS_ARCHIVE_OS $bundle/default.metallib $script -o $raw.metal4
+xcrun metal-tt -arch $METAL3_GPU -tvos-version-min $TVOS_ARCHIVE_OS ${script%.mtl4-json}.mtlp-json -o $raw.metal3
+xcrun metal-lipo -create $raw.metal4 $raw.metal3 -output $raw
 compression_tool -encode -a lzfse -i $raw -o $bundle/$NAME-pipelines.metallib.lzfse
-print "archive: $(stat -f %z $raw) bytes unpacked"
+print "archive: $(stat -f %z $raw) bytes unpacked ($(xcrun metal-lipo -info $raw))"
 
 mkdir -p $ROOT/Frameworks
 output=$ROOT/Frameworks/$NAME.xcframework
