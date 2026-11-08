@@ -6364,56 +6364,42 @@
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "StringLiteral",
-      "offset": 2192,
+      "offset": 2206,
       "length": 26,
       "value": "\"LibDeinterlace-pipelines\""
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "StringLiteral",
-      "offset": 2303,
+      "offset": 2317,
       "length": 16,
       "value": "\"metallib.lzfse\""
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "Array",
-      "offset": 12001,
+      "offset": 12015,
       "length": 2,
       "value": "[]"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "StringLiteral",
-      "offset": 16469,
+      "offset": 16483,
       "length": 15,
       "value": "\"fm_accumulate\""
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16572,
+      "offset": 16586,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16680,
-      "length": 1,
-      "value": "0"
-    },
-    {
-      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
-      "kind": "IntegerLiteral",
-      "offset": 16811,
-      "length": 1,
-      "value": "2"
-    },
-    {
-      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
-      "kind": "IntegerLiteral",
-      "offset": 16821,
+      "offset": 16694,
       "length": 1,
       "value": "0"
     },
@@ -6422,117 +6408,117 @@
       "kind": "IntegerLiteral",
       "offset": 16825,
       "length": 1,
-      "value": "8"
+      "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16829,
+      "offset": 16835,
+      "length": 1,
+      "value": "0"
+    },
+    {
+      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
+      "kind": "IntegerLiteral",
+      "offset": 16839,
       "length": 1,
       "value": "8"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16841,
+      "offset": 16843,
+      "length": 1,
+      "value": "8"
+    },
+    {
+      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
+      "kind": "IntegerLiteral",
+      "offset": 16855,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16899,
+      "offset": 16913,
       "length": 1,
       "value": "3"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16904,
+      "offset": 16918,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16907,
+      "offset": 16921,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16957,
+      "offset": 16971,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 16991,
+      "offset": 17005,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 17036,
+      "offset": 17050,
       "length": 1,
       "value": "6"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "StringLiteral",
-      "offset": 17915,
+      "offset": 17929,
       "length": 12,
       "value": "\"fm_diffmap\""
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "StringLiteral",
-      "offset": 17998,
+      "offset": 18012,
       "length": 15,
       "value": "\"fm_accumulate\""
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "BooleanLiteral",
-      "offset": 18029,
+      "offset": 18043,
       "length": 5,
       "value": "false"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18103,
+      "offset": 18117,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "Array",
-      "offset": 18212,
+      "offset": 18226,
       "length": 2,
       "value": "[]"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18228,
-      "length": 1,
-      "value": "0"
-    },
-    {
-      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
-      "kind": "IntegerLiteral",
-      "offset": 18417,
-      "length": 1,
-      "value": "2"
-    },
-    {
-      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
-      "kind": "IntegerLiteral",
-      "offset": 18427,
+      "offset": 18242,
       "length": 1,
       "value": "0"
     },
@@ -6541,334 +6527,348 @@
       "kind": "IntegerLiteral",
       "offset": 18431,
       "length": 1,
-      "value": "8"
+      "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18435,
+      "offset": 18441,
+      "length": 1,
+      "value": "0"
+    },
+    {
+      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
+      "kind": "IntegerLiteral",
+      "offset": 18445,
       "length": 1,
       "value": "8"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18447,
+      "offset": 18449,
+      "length": 1,
+      "value": "8"
+    },
+    {
+      "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
+      "kind": "IntegerLiteral",
+      "offset": 18461,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18505,
+      "offset": 18519,
       "length": 1,
       "value": "3"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18510,
+      "offset": 18524,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18513,
+      "offset": 18527,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18563,
+      "offset": 18577,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18597,
+      "offset": 18611,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18660,
+      "offset": 18674,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18708,
+      "offset": 18722,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18789,
+      "offset": 18803,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18793,
+      "offset": 18807,
       "length": 1,
       "value": "3"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 18973,
+      "offset": 18987,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19084,
+      "offset": 19098,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19177,
+      "offset": 19191,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19187,
+      "offset": 19201,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19234,
+      "offset": 19248,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19244,
+      "offset": 19258,
       "length": 1,
       "value": "5"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19283,
+      "offset": 19297,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19293,
+      "offset": 19307,
       "length": 1,
       "value": "7"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19327,
+      "offset": 19341,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19468,
+      "offset": 19482,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19480,
+      "offset": 19494,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19521,
+      "offset": 19535,
       "length": 1,
       "value": "3"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19526,
+      "offset": 19540,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19538,
+      "offset": 19552,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19543,
+      "offset": 19557,
       "length": 1,
       "value": "2"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19735,
+      "offset": 19749,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19739,
+      "offset": 19753,
       "length": 1,
       "value": "3"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19839,
+      "offset": 19853,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19843,
+      "offset": 19857,
       "length": 1,
       "value": "8"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19847,
+      "offset": 19861,
       "length": 1,
       "value": "8"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 19984,
+      "offset": 19998,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20102,
+      "offset": 20116,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20157,
+      "offset": 20171,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20162,
+      "offset": 20176,
       "length": 1,
       "value": "6"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20266,
+      "offset": 20280,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20276,
+      "offset": 20290,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20323,
+      "offset": 20337,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20333,
+      "offset": 20347,
       "length": 1,
       "value": "5"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20380,
+      "offset": 20394,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20390,
+      "offset": 20404,
       "length": 1,
       "value": "6"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20429,
+      "offset": 20443,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20439,
+      "offset": 20453,
       "length": 1,
       "value": "7"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20483,
+      "offset": 20497,
       "length": 1,
       "value": "0"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20493,
+      "offset": 20507,
       "length": 1,
       "value": "8"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "IntegerLiteral",
-      "offset": 20531,
+      "offset": 20545,
       "length": 1,
       "value": "1"
     },
     {
       "filePath": "\/Users\/matthewfaust\/Github\/tvosplayer\/LibDeinterlace\/Development\/Sources\/LibDeinterlace\/Kernels.swift",
       "kind": "BooleanLiteral",
-      "offset": 20651,
+      "offset": 20665,
       "length": 4,
       "value": "true"
     }
